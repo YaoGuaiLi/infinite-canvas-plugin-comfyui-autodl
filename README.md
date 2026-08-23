@@ -15,6 +15,25 @@ https://raw.githubusercontent.com/YaoGuaiLi/infinite-canvas-plugin-comfyui-autod
 
 推荐 jsDelivr 版本化地址(锁定 `v1.0.0` 标签);raw 地址始终指向 main 最新。升级时发新 tag 后把版本号换掉即可。
 
+## 内置工作流预设(v1.1.0)
+
+面板下拉直接选,无需手填 ID 与 JSON:
+
+| 工作流 | 预设 | 说明 |
+| --- | --- | --- |
+| `minimax_h3_lightx2v_no_pic` | H3 文生视频 | 纯提示词;时长 1-15s;480p/768p |
+| `minimax_h3_lightx2v_v5` | H3 多图参考生视频 | 最多 9 张参考图(首张必填);seed;最高 1080p |
+| `minimax_h3_lightx2v_v5_15s` | H3 多图参考生视频 15 秒 | 时长 1-15s;最高 768p |
+| `minimax_h3_lightx2v` | H3 首尾帧生视频 | 取参考图第 1、2 张作 first/last_frame |
+| `minimax_h3_image_audio_to_video` | H3 图生视频·自动对口型 | 1 图 + 1 音频必填,无 prompt;audio_duration 1-15s |
+| `minimax_h3_image_audio_to_video_v2` | H3 多图多音频生视频 | 多图多音频参考;需精确控制提示词 |
+| `minimax_h3_image_audio_to_video_v2_15s` | H3 多图多音频生视频 15 秒 | 同上,最长 15s,最高 768p |
+| `indextts2-v1` | IndexTTS2 语音合成 | prompt→prompt_text;情感参数 JSON 模板自动预填;输出 wav |
+
+计费参考:视频 480p/768p ¥0.01/秒、1080p ¥0.10-0.11/秒;TTS ¥0.01/次。
+
+**参考素材怎么给**:把画布上的图片/音频节点**连线**到本节点上游,按连线顺序自动映射 `ref_image_0…8` / `ref_audio_0…2`;也可在面板「手动参考 URL」每行填一个(排在连线之前)。首尾帧工作流取前两张图作 first/last_frame。
+
 ## 使用
 
 1. 到 [令牌管理](https://autodl.art/large-model/tokens) 创建令牌,**分组选 ComfyUI**。
