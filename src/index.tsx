@@ -485,7 +485,9 @@ async function fetchJson<T>(url: string, token: string | null, signal: AbortSign
 async function loadCatalog(apiBase: string, token: string, storage: PluginStorage, signal: AbortSignal): Promise<WorkflowCatalog> {
     const cached = await storage.get<WorkflowCatalog>("catalog");
     const fresh = cached && Date.now() - cached.fetchedAt < CATALOG_TTL_MS && cached.workflows.length > 0 ? cached : null;
-    const listData = await fetchJson<Array<{ uuid: string; name: string; description?: string }>>(`${apiBase}/api/v1/comfyui/workflows`, token || null, signal, { method: "POST", jsonBody: "{}" });
+    // 响应结构是 data:{ list:[...] },列表在 data.list 里,不能把 data 当数组用
+    const listPayload = await fetchJson<{ list?: Array<{ uuid: string; name: string; description?: string }> }>(`${apiBase}/api/v1/comfyui/workflows`, token || null, signal, { method: "POST", jsonBody: "{}" });
+    const listData = listPayload?.list ?? [];
     if (!listData?.length) {
         if (fresh) return fresh;
         // 网络失败且无缓存 → 内置预设兜底(标记 fetchedAt=0,UI 提示为「内置预设」)
@@ -1211,7 +1213,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.3.2",
+    version: "1.3.3",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [
