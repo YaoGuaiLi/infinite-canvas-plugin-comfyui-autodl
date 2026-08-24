@@ -7,6 +7,7 @@ import { definePlugin, useEffect, useState } from "@infinite-canvas/plugin-sdk";
 import localforage from "localforage";
 import type { CSSProperties } from "react";
 import type { CanvasNodeContentProps, CanvasNodeContext, CanvasNodeData, CanvasNodePanelProps, CanvasNodeResource } from "@infinite-canvas/plugin-sdk";
+import type { PluginStorage } from "@infinite-canvas/plugin-sdk";
 
 const DEFAULT_API_BASE = "https://autodl.art";
 const POLL_INTERVAL_MS = 2000;
@@ -259,10 +260,13 @@ function assembleBody(preset: WorkflowPreset | undefined, meta: Record<string, u
 
 type InputRule = {
     required?: boolean;
-    type?: string; // "image" | "audio" | "number" | "enum" | …
+    type?: string; // "image" | "audio" | "number" | "boolean" | "enum" | "string" | "prompt" | …
     accept_types?: string[];
     min?: number;
     max?: number;
+    min_length?: number;
+    max_length?: number;
+    default?: unknown;
     options?: Array<{ label: string }>;
 };
 
@@ -276,6 +280,112 @@ async function fetchInputRules(apiBase: string, workflowId: string, token: strin
     } catch {
         return {}; // 详情接口不可用时静默降级为本地预设校验
     }
+}
+
+// 旧版(无 input_rules 时)的必填校验:与 assembleBody 内联校验一致
+function validateLegacy(preset: WorkflowPreset | undefined, body: Record<string, unknown>): string | null {
+    if (preset?.firstLastFrame && (!body.first_frame || !body.last_frame)) return "首尾帧工作流需要 2 张参考图:连线两个图片节点,或在「手动参考图」里每行填一个图片 URL";
+    if (preset?.refImages && !preset.firstLastFrame && !("ref_image_0" in body)) return "该工作流要求至少 1 张参考图(ref_image_0):连线一个图片节点,或在「手动参考图」里填图片 URL";
+    if (preset?.lipSync && (!body.ref_audio_0 || !body.ref_image_0)) return "对口型工作流需要 1 条参考音频和 1 张参考图:连线上游或手动填写 URL";
+    if (preset?.tts && !String(body.prompt_text ?? "").trim()) return "请填写要合成的文本";
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// 动态素材分配:有 input_rules 时,把上游连线 + 手动 URL 的素材按槽位声明的
+// 类型(image/audio)逐个填充 ref_image_N / ref_audio_N 等槽位,不再依赖预设表。
+// ---------------------------------------------------------------------------
+
+function ruleAcceptsKind(rule: InputRule): "image" | "audio" | null {
+    if (rule.type === "image") return "image";
+    if (rule.type === "audio") return "audio";
+    // 类型未标注但带 MIME 白名单时按白名单推断
+    const accepts = rule.accept_types ?? [];
+    if (accepts.some((item) => item.startsWith("image/"))) return "image";
+    if (accepts.some((item) => item.startsWith("audio/"))) return "audio";
+    return null;
+}
+
+async function collectRefsForRules(
+    ctx: CanvasNodeContext,
+    meta: Record<string, unknown>,
+    rules: Record<string, InputRule>,
+    preset: WorkflowPreset | undefined,
+    signal: AbortSignal,
+): Promise<{ images: string[]; audios: string[] }> {
+    // 无规则或首尾帧等预设特例 → 走旧的按类收集(返回原始 RefSource,由调用方统一转 data URL)
+    if (!Object.keys(rules).length || preset?.firstLastFrame) {
+        const legacy = collectRefs(ctx, meta);
+        const images: string[] = [];
+        const audios: string[] = [];
+        for (const ref of legacy.images) images.push(await refToDataUrl(ref, signal));
+        for (const ref of legacy.audios) audios.push(await refToDataUrl(ref, signal));
+        return { images, audios };
+    }
+
+    // 槽位清单:规则里所有 image/audio 槽,按名称排序保证编号稳定
+    const slots = Object.entries(rules)
+        .filter(([, rule]) => ruleAcceptsKind(rule))
+        .sort(([a], [b]) => a.localeCompare(b, undefined, { numeric: true }))
+        .map(([name, rule]) => ({ name, kind: ruleAcceptsKind(rule) as "image" | "audio" }));
+
+    const manualImages = splitLines(String(meta.refImageUrls ?? ""));
+    const manualAudios = splitLines(String(meta.refAudioUrls ?? ""));
+    const pool: Array<{ url: string; storageKey?: string; kind: "image" | "audio" }> = [];
+    for (const node of ctx.getUpstream()) {
+        const url = typeof node.metadata?.content === "string" ? node.metadata.content : "";
+        if (!url) continue;
+        const kind = upstreamKind(node);
+        if (kind === "other") continue;
+        const storageKey = typeof node.metadata?.storageKey === "string" ? node.metadata.storageKey : undefined;
+        pool.push({ url, storageKey, kind });
+    }
+
+    const filled: Array<{ name: string; source: { url: string; storageKey?: string } }> = [];
+    const usedUrl = new Set<string>();
+    for (const slot of slots) {
+        // 手动 URL 优先占同类型槽位
+        const manualQueue = slot.kind === "image" ? manualImages : manualAudios;
+        while (manualQueue.length && filled.length < slots.length) {
+            const url = manualQueue.shift() as string;
+            filled.push({ name: slot.name, source: { url } });
+            usedUrl.add(url);
+            break;
+        }
+        if (filled.at(-1)?.name === slot.name) continue;
+        // 再从上游连线取第一个未被占用的同类型素材
+        const match = pool.find((item) => item.kind === slot.kind && !usedUrl.has(item.url));
+        if (!match) continue;
+        usedUrl.add(match.url);
+        filled.push({ name: slot.name, source: { url: match.url, storageKey: match.storageKey } });
+    }
+
+    const body: Record<string, string> = {};
+    for (const entry of filled) body[entry.name] = await refToDataUrl(entry.source, signal);
+    // 额外素材仍按旧编号暴露给兼容参数(paramsJson 可引用)
+    for (const url of [...manualImages, ...pool.filter((item) => item.kind === "image").map((item) => item.url)]) {
+        if (!usedUrl.has(url)) body[`ref_image_${Object.keys(body).length}`] = url; // 理论不可达,防御性兜底
+    }
+    void preset;
+    return groupSlotsByKind(filled, body, rules);
+}
+
+// 把已填槽位按 image/audio 归组返回,保持 runWorkflow/assembleBody 的既有签名
+function groupSlotsByKind(
+    filled: Array<{ name: string; source: { url: string; storageKey?: string } }>,
+    resolved: Record<string, string>,
+    rules: Record<string, InputRule>,
+): { images: string[]; audios: string[] } {
+    const images: string[] = [];
+    const audios: string[] = [];
+    for (const entry of filled) {
+        const kind = ruleAcceptsKind(rules[entry.name]);
+        const value = resolved[entry.name];
+        if (!value) continue;
+        if (kind === "audio") audios.push(value);
+        else images.push(value);
+    }
+    return { images, audios };
 }
 
 function mimeAllowed(url: string, rule: InputRule): boolean {
@@ -311,6 +421,70 @@ function validateWithRules(rules: Record<string, InputRule>, body: Record<string
         }
     }
     return null;
+}
+
+// ---------------------------------------------------------------------------
+// 运行时驱动的动态目录:工作流列表与 input_rules 全部来自接口,
+// 面板表单按规则渲染,上游素材按 accept_types 自动分配槽位;
+// 接口不可用时降级为内置预设(WORKFLOWS 表仅作离线兜底)。
+// ---------------------------------------------------------------------------
+
+type DynamicWorkflow = {
+    id: string;
+    label: string; // 官方 name
+    description?: string;
+    rules?: Record<string, InputRule>; // 拉到详情后填充
+};
+
+type WorkflowCatalog = {
+    workflows: DynamicWorkflow[];
+    fetchedAt: number; // 0 表示尚未成功联网
+};
+
+const CATALOG_TTL_MS = 10 * 60 * 1000;
+
+async function fetchJson<T>(url: string, token: string | null, signal: AbortSignal): Promise<T | null> {
+    try {
+        const response = await fetch(url, { headers: token ? { Authorization: token } : {}, signal });
+        if (!response.ok) return null;
+        const payload = (await response.json().catch(() => null)) as { code?: string; data?: unknown } | null;
+        if (payload?.code !== "Success" || payload.data == null) return null;
+        return payload.data as T;
+    } catch {
+        return null;
+    }
+}
+
+// 列表接口无需 Token 也可用;详情需要 Token。缓存进 storage,过期后台刷新。
+async function loadCatalog(apiBase: string, token: string, storage: PluginStorage, signal: AbortSignal): Promise<WorkflowCatalog> {
+    const cached = await storage.get<WorkflowCatalog>("catalog");
+    const fresh = cached && Date.now() - cached.fetchedAt < CATALOG_TTL_MS && cached.workflows.length > 0 ? cached : null;
+    const listData = await fetchJson<Array<{ uuid: string; name: string; description?: string }>>(`${apiBase}/api/v1/comfyui/workflows`, token || null, signal);
+    if (!listData?.length) {
+        if (fresh) return fresh;
+        // 网络失败且无缓存 → 内置预设兜底(标记 fetchedAt=0,UI 提示为「内置预设」)
+        return { workflows: WORKFLOWS.map((preset) => ({ id: preset.id, label: preset.label, description: preset.desc })), fetchedAt: 0 };
+    }
+    const catalog: WorkflowCatalog = {
+        workflows: listData.map((item) => ({ id: item.uuid, label: item.name || item.uuid, description: item.description })),
+        fetchedAt: Date.now(),
+    };
+    void storage.set("catalog", catalog).catch(() => undefined);
+    return catalog;
+}
+
+async function loadRules(apiBase: string, workflowId: string, token: string, storage: PluginStorage, signal: AbortSignal): Promise<Record<string, InputRule>> {
+    const cacheKey = `rules:${workflowId}`;
+    const cached = await storage.get<{ rules: Record<string, InputRule>; fetchedAt: number }>(cacheKey);
+    if (cached && Date.now() - cached.fetchedAt < CATALOG_TTL_MS) return cached.rules;
+    const data = await fetchJson<{ input_rules?: Record<string, InputRule> }>(`${apiBase}/api/v1/comfyui/workflows/${encodeURIComponent(workflowId)}`, token, signal);
+    const rules = data?.input_rules ?? {};
+    if (Object.keys(rules).length) void storage.set(cacheKey, { rules, fetchedAt: Date.now() }).catch(() => undefined);
+    return Object.keys(rules).length ? rules : cached?.rules ?? {};
+}
+
+function findDynamic(catalog: WorkflowCatalog | null, workflowId: string): DynamicWorkflow | undefined {
+    return catalog?.workflows.find((item) => item.id === workflowId);
 }
 
 async function submitTask(apiBase: string, workflowId: string, body: Record<string, unknown>, token: string, signal: AbortSignal): Promise<string> {
@@ -386,21 +560,40 @@ async function runWorkflow(ctx: CanvasNodeContext) {
     try {
         // 画布节点的 blob: 地址只在当前页面有效,先全部落地为可直接提交的地址
         ctx.updateMetadata({ progress: "读取参考素材…" });
-        const rawRefs = collectRefs(ctx, meta);
-        const refs = { images: [] as string[], audios: [] as string[] };
-        for (const ref of rawRefs.images) refs.images.push(await refToDataUrl(ref, controller.signal));
-        for (const ref of rawRefs.audios) refs.audios.push(await refToDataUrl(ref, controller.signal));
-
         const preset = findPreset(workflowId);
-        const body = assembleBody(preset, meta, refs);
-
-        // 详情接口校验(不可用时降级为本地预设规则)
-        ctx.updateMetadata({ progress: "校验参数…" });
-        const rules = await fetchInputRules(apiBase, workflowId, token, controller.signal);
+        // 动态模式:优先用接口 input_rules;拿不到时才退回内置预设
+        const rules = await loadRules(apiBase, workflowId, token, ctx.storage, controller.signal);
         if (controller.signal.aborted) return;
-        if (Object.keys(rules).length) {
+        const dynamic = Object.keys(rules).length > 0;
+
+        const refs = await collectRefsForRules(ctx, meta, rules, preset, controller.signal);
+
+        const body = assembleBody(preset, meta, refs);
+        // 动态表单值(paramsDyn)按规则类型并入请求体:number/boolean 转型,其余字符串
+        if (dynamic && meta.paramsDyn && typeof meta.paramsDyn === "object") {
+            for (const [name, rawValue] of Object.entries(meta.paramsDyn as Record<string, string>)) {
+                const rule = rules[name];
+                if (!rule || ruleAcceptsKind(rule)) continue; // 素材槽位由连线分配,跳过
+                const trimmed = String(rawValue).trim();
+                if (trimmed === "") continue;
+                if (rule.type === "number") {
+                    const parsed = Number(trimmed);
+                    if (Number.isFinite(parsed)) body[name] = parsed;
+                } else if (rule.type === "boolean") {
+                    body[name] = trimmed === "true";
+                } else {
+                    body[name] = trimmed;
+                }
+            }
+        }
+        // paramsJson 覆盖后仍以动态规则做最终校验
+        if (dynamic) {
+            ctx.updateMetadata({ progress: "校验参数…" });
             const problem = validateWithRules(rules, body);
             if (problem) throw new Error(problem);
+        } else {
+            const legacyProblem = validateLegacy(preset, body);
+            if (legacyProblem) throw new Error(legacyProblem);
         }
 
         const taskId = await submitTask(apiBase, workflowId, body, token, controller.signal);
@@ -538,6 +731,9 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     const meta = ctx.node.metadata ?? {};
     const s = ui(ctx);
     const [workflowId, setWorkflowId] = useState(() => String(meta.workflowId ?? ""));
+    // 动态目录:接口拉取的工作流列表与当前选中项的 input_rules
+    const [catalog, setCatalog] = useState<WorkflowCatalog | null>(null);
+    const [rules, setRules] = useState<Record<string, InputRule> | null>(null);
     const [prompt, setPrompt] = useState(() => String(meta.prompt ?? ""));
     const [duration, setDuration] = useState(() => String(meta.wfDuration ?? ""));
     const [resolution, setResolution] = useState(() => String(meta.wfResolution ?? ""));
@@ -545,6 +741,15 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     const [audioDuration, setAudioDuration] = useState(() => String(meta.wfAudioDuration ?? ""));
     const [refImageUrls, setRefImageUrls] = useState(() => String(meta.refImageUrls ?? ""));
     const [refAudioUrls, setRefAudioUrls] = useState(() => String(meta.refAudioUrls ?? ""));
+    // 动态表单值:非 prompt/素材类参数按参数名存进 paramsDyn(如 seed、emo_calm)
+    const [paramsDyn, setParamsDyn] = useState<Record<string, string>>(() => {
+        try {
+            const raw = meta.paramsDyn;
+            return raw && typeof raw === "object" ? (raw as Record<string, string>) : {};
+        } catch {
+            return {};
+        }
+    });
     const [paramsJson, setParamsJson] = useState(() => String(meta.paramsJson ?? ""));
     const [resultKind, setResultKind] = useState<ResultKind>(() => ((typeof meta.resultKind === "string" && meta.resultKind) as ResultKind) || "auto");
     const [tokenDraft, setTokenDraft] = useState("");
@@ -553,6 +758,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     const [advancedOpen, setAdvancedOpen] = useState(false);
 
     const preset = findPreset(workflowId);
+    const dynamicEntry = findDynamic(catalog, workflowId);
 
     // 上游连线统计,提示参考素材会自动收集
     const upstreamStats = (() => {
@@ -570,11 +776,29 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     useEffect(() => {
         void ctx.storage.get<string>("token").then((value) => value && setTokenDraft(value)).finally(() => setTokenLoaded(true));
         void ctx.storage.get<string>("apiBase").then((value) => value && setApiBase(value));
+        // 拉取动态工作流列表:先用缓存立即渲染,再后台刷新
+        const controller = new AbortController();
+        (async () => {
+            const token = String((await ctx.storage.get<string>("token")) || "").trim();
+            const api = (String((await ctx.storage.get<string>("apiBase")) || "").trim() || DEFAULT_API_BASE).replace(/\/+$/, "");
+            const cached = await ctx.storage.get<WorkflowCatalog>("catalog");
+            if (cached?.workflows?.length && !cached.fetchedAt) setCatalog(cached); // 极端情况防御
+            else if (cached?.workflows?.length && Date.now() - cached.fetchedAt < CATALOG_TTL_MS) setCatalog(cached);
+            const next = await loadCatalog(api, token, ctx.storage, controller.signal);
+            if (!controller.signal.aborted) setCatalog(next);
+            const currentId = String(ctx.getNode(ctx.node.id)?.metadata?.workflowId ?? workflowId);
+            if (currentId) {
+                const nextRules = await loadRules(api, currentId, token || "anonymous", ctx.storage, controller.signal);
+                if (!controller.signal.aborted && Object.keys(nextRules).length) setRules(nextRules);
+            }
+        })();
+        return () => controller.abort();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     const patch = (update: Record<string, unknown>) => ctx.updateMetadata(update);
 
-    const selectWorkflow = (nextId: string) => {
+    const selectWorkflow = async (nextId: string) => {
         setWorkflowId(nextId);
         const next = findPreset(nextId);
         const update: Record<string, unknown> = { workflowId: nextId };
@@ -588,30 +812,69 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
             update.paramsJson = template;
         }
         patch(update);
+        // 拉取新工作流的动态规则(有缓存时同步返回),供面板即时渲染
+        if (nextId && catalog) {
+            const controller = new AbortController();
+            const nextRules = await loadRules(apiBase.trim() || DEFAULT_API_BASE, nextId, tokenDraft.trim() || "anonymous", ctx.storage, controller.signal);
+            setRules(Object.keys(nextRules).length ? nextRules : null);
+        } else {
+            setRules(null);
+        }
+    };
+
+    // 切换/加载 Token 后刷新动态目录与当前工作流的规则
+    const refreshCatalog = async () => {
+        const controller = new AbortController();
+        const token = tokenDraft.trim();
+        const api = apiBase.trim() || DEFAULT_API_BASE;
+        const next = await loadCatalog(api, token, ctx.storage, controller.signal);
+        setCatalog(next);
+        if (workflowId) {
+            const nextRules = await loadRules(api, workflowId, token || "anonymous", ctx.storage, controller.signal);
+            if (Object.keys(nextRules).length) setRules(nextRules);
+        }
     };
 
     const saveToken = async () => {
         await ctx.storage.set("token", tokenDraft.trim());
         await ctx.storage.set("apiBase", apiBase.trim() || DEFAULT_API_BASE);
+        // Token 就绪后刷新目录与规则(详情接口需要 Token)
+        void refreshCatalog();
     };
 
     const busy = meta.status === "loading";
-    const showRefImages = Boolean(preset && (preset.refImages || preset.firstLastFrame) && !preset.tts);
-    const showRefAudios = Boolean(preset && (preset.refAudios || preset.lipSync));
+    const activeRules: Record<string, InputRule> = rules ?? {};
+    const usingDynamic = Object.keys(activeRules).length > 0;
+    const showRefImages = usingDynamic
+        ? Object.values(activeRules).some((rule) => ruleAcceptsKind(rule) === "image")
+        : Boolean(preset && (preset.refImages || preset.firstLastFrame) && !preset.tts);
+    const showRefAudios = usingDynamic
+        ? Object.values(activeRules).some((rule) => ruleAcceptsKind(rule) === "audio")
+        : Boolean(preset && (preset.refAudios || preset.lipSync));
+
+    // 动态参数槽:排除素材类(由连线分配)、prompt 类(prompt 状态已覆盖)后的其余参数
+    const dynamicParams = usingDynamic
+        ? Object.entries(activeRules)
+              .filter(([name, rule]) => !ruleAcceptsKind(rule) && !(name === "prompt" || (rule.type === "string" && name === "prompt_text")) )
+              .sort(([a], [b]) => a.localeCompare(b))
+        : [];
     const tokenMissing = tokenLoaded && !tokenDraft.trim();
 
     return (
         <div data-canvas-no-zoom onMouseDown={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()} style={s.card}>
             <div style={s.row}>
                 <div style={{ ...s.cell, flex: "2 1 60%" }}>
-                    <label style={s.label}>工作流</label>
-                    <select value={WORKFLOWS.some((item) => item.id === workflowId) ? workflowId : ""} onChange={(e) => selectWorkflow(e.target.value)} style={s.pill}>
+                    <label style={s.label}>工作流{catalog ? (catalog.fetchedAt ? "" : "(内置预设,联网后自动更新)") : "(加载中…)"}</label>
+                    <select value={workflowId} onChange={(e) => selectWorkflow(e.target.value)} style={s.pill}>
                         <option value="">自定义(手填 ID)</option>
-                        {WORKFLOWS.map((item) => (
+                        {(catalog?.workflows ?? WORKFLOWS.map((preset) => ({ id: preset.id, label: preset.label }))).map((item) => (
                             <option key={item.id} value={item.id}>{item.label}</option>
                         ))}
                     </select>
-                    {preset ? <div style={{ ...s.hint, marginTop: 3 }}>{preset.desc} · {preset.id}</div> : null}
+                    <div style={{ ...s.hint, marginTop: 3 }}>
+                        {dynamicEntry?.description ? `${dynamicEntry.description.slice(0, 80)}… · ` : ""}
+                        {dynamicEntry?.label ?? preset?.desc ?? workflowId} · {workflowId || "未选择"}
+                    </div>
                 </div>
                 <div style={s.cell}>
                     <label style={s.label}>结果</label>
@@ -630,6 +893,75 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                 </>
             ) : null}
 
+            {!preset && !dynamicEntry ? (
+                <>
+                    <label style={s.label}>工作流 ID</label>
+                    <input value={workflowId} placeholder="如 minimax_h3_lightx2v_no_pic" onChange={(e) => { setWorkflowId(e.target.value); patch({ workflowId: e.target.value }); }} style={s.pill} />
+                </>
+            ) : null}
+
+            {/* 动态参数区:按 input_rules 渲染 prompt/string/number/boolean/enum 控件 */}
+            {usingDynamic ? (
+                <>
+                    {Object.entries(activeRules).filter(([name, rule]) => name === "prompt" || (rule.type === "string" && name === "prompt_text")).map(([name, rule]) => (
+                        <div key={name}>
+                            <label style={s.label}>{name === "prompt" ? "提示词" : `${name}(文本)`}{rule.required ? " *" : ""}</label>
+                            <textarea
+                                value={prompt}
+                                maxLength={typeof rule.max_length === "number" ? rule.max_length : undefined}
+                                placeholder={name === "prompt" ? "描述主体、动作、场景、镜头…" : `输入 ${name}`}
+                                onWheel={(e) => e.stopPropagation()}
+                                onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }}
+                                style={s.prompt}
+                            />
+                        </div>
+                    ))}
+                    <div style={s.row}>
+                        {dynamicParams.map(([name, rule]) => {
+                            const raw = paramsDyn[name] ?? "";
+                            const setValue = (next: string) => { setParamsDyn((prev) => { const merged = { ...prev, [name]: next }; patch({ paramsDyn: merged }); return merged; }); };
+                            if (rule.type === "boolean") {
+                                return (
+                                    <div key={name} style={s.cell}>
+                                        <label style={s.label}>{name}</label>
+                                        <select value={raw || String(rule.default ?? "")} onChange={(e) => setValue(e.target.value)} style={s.pill}>
+                                            <option value="true">开启</option>
+                                            <option value="false">关闭</option>
+                                        </select>
+                                    </div>
+                                );
+                            }
+                            if (rule.type === "enum" && rule.options?.length) {
+                                return (
+                                    <div key={name} style={s.cell}>
+                                        <label style={s.label}>{name}</label>
+                                        <select value={raw || String(rule.default ?? "")} onChange={(e) => setValue(e.target.value)} style={s.pill}>
+                                            {rule.options.map((option) => (
+                                                <option key={option.label} value={option.label}>{option.label}</option>
+                                            ))}
+                                        </select>
+                                    </div>
+                                );
+                            }
+                            if (rule.type === "number") {
+                                return (
+                                    <div key={name} style={s.cell}>
+                                        <label style={s.label}>{name}{typeof rule.min === "number" && typeof rule.max === "number" ? `(${rule.min}-${rule.max})` : ""}</label>
+                                        <input value={raw} placeholder={rule.default !== undefined ? `默认 ${rule.default}` : "数值"} inputMode="decimal" onChange={(e) => setValue(e.target.value)} style={s.pill} />
+                                    </div>
+                                );
+                            }
+                            return (
+                                <div key={name} style={{ ...s.cell, flexBasis: "100%" }}>
+                                    <label style={s.label}>{name}{rule.required ? " *" : ""}</label>
+                                    <input value={raw} placeholder={`输入 ${name}`} onChange={(e) => setValue(e.target.value)} style={s.pill} />
+                                </div>
+                            );
+                        })}
+                    </div>
+                </>
+            ) : (
+                <>
             {(!preset || preset.hasPrompt) && !preset?.tts ? (
                 <>
                     <label style={s.label}>提示词</label>
@@ -642,6 +974,8 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                     <textarea value={prompt} placeholder="要朗读的文本…" onWheel={(e) => e.stopPropagation()} onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }} style={s.prompt} />
                 </>
             ) : null}
+                </>
+            )}
 
             {(preset?.duration || preset?.resolutions || preset?.seed || preset?.audioDuration) ? (
                 <div style={s.row}>
@@ -739,7 +1073,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.2.0",
+    version: "1.3.0",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [
