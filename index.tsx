@@ -4,6 +4,7 @@
 // 面板视觉对齐宿主官方面板(canvas-node-prompt-panel)的设计语言。
 // API 文档: https://autodl.art/docs/comfyui_api/
 import { definePlugin, useEffect, useState } from "@infinite-canvas/plugin-sdk";
+import localforage from "localforage";
 import type { CSSProperties } from "react";
 import type { CanvasNodeContentProps, CanvasNodeContext, CanvasNodeData, CanvasNodePanelProps, CanvasNodeResource } from "@infinite-canvas/plugin-sdk";
 
@@ -96,6 +97,61 @@ const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp)(\?|#|$)/i;
 const VIDEO_EXT = /\.(mp4|webm|mov|m4v)(\?|#|$)/i;
 const AUDIO_EXT = /\.(mp3|wav|flac|m4a|aac|ogg)(\?|#|$)/i;
 
+// ---------------------------------------------------------------------------
+// 参考素材落地:画布节点的 blob:/data: 地址只在当前浏览器有效,直接提交会被
+// 服务端以「参数值非法」拒绝;提交前把本地素材读出来转成 data URL 内联进请求体。
+// ---------------------------------------------------------------------------
+
+const REMOTE_URL = /^https?:\/\//i;
+
+function mimeOfDataUrl(url: string): string {
+    const match = /^data:([^;,]+)/i.exec(url);
+    return match ? match[1].toLowerCase() : "";
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result));
+        reader.onerror = () => reject(new Error("读取本地参考素材失败"));
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function toSubmittableUrl(url: string, signal?: AbortSignal): Promise<string> {
+    if (REMOTE_URL.test(url)) return url;
+    if (url.startsWith("data:")) return url;
+    if (!url.startsWith("blob:")) throw new Error(`参考素材地址不支持(${url.slice(0, 48)}…):请连线画布节点或填写公网 URL`);
+    const response = await fetch(url, { signal });
+    if (!response.ok) throw new Error(`读取本地参考素材失败(HTTP ${response.status}):可能是页面刷新后临时地址失效,请重新生成该节点内容`);
+    return blobToDataUrl(await response.blob());
+}
+
+// 带持久化键的素材来源:url 是展示用地址(可能为已失效的 blob:),storageKey 可从宿主 IndexedDB 兜底
+type RefSource = { url: string; storageKey?: string };
+
+// 宿主 localforage 库名固定为 infinite-canvas,image 存 image_files,音视频存 media_files
+const HOST_IMAGE_STORE = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
+const HOST_MEDIA_STORE = localforage.createInstance({ name: "infinite-canvas", storeName: "media_files" });
+
+async function readStoredBlob(storageKey: string): Promise<Blob | null> {
+    const [family] = storageKey.split(":");
+    const store = family === "audio" || family === "video" ? HOST_MEDIA_STORE : HOST_IMAGE_STORE;
+    return (await store.getItem<Blob>(storageKey)) ?? null;
+}
+
+async function refToDataUrl(ref: RefSource, signal?: AbortSignal): Promise<string> {
+    try {
+        return await toSubmittableUrl(ref.url, signal);
+    } catch (error) {
+        // blob: 地址随页面刷新失效;storageKey 指向的 IndexedDB 数据仍在,兜底读取
+        if (!(ref.url.startsWith("blob:") && ref.storageKey)) throw error;
+        const blob = await readStoredBlob(ref.storageKey);
+        if (!blob) throw new Error("本地参考素材已失效且存储中未找到:请重新生成该节点内容");
+        return blobToDataUrl(blob);
+    }
+}
+
 // results 元素兼容字符串或 { url, type, file_type } 对象
 function pickResult(results: unknown): { url: string; fileType?: string } {
     for (const item of Array.isArray(results) ? results : []) {
@@ -130,15 +186,18 @@ function upstreamKind(node: CanvasNodeData): "image" | "audio" | "other" {
 }
 
 // 参考素材 = 手动 URL(每行一个,占前面的编号)+ 上游连线节点按连线顺序补足
-function collectRefs(ctx: CanvasNodeContext, meta: Record<string, unknown>): { images: string[]; audios: string[] } {
-    const images = splitLines(String(meta.refImageUrls ?? ""));
-    const audios = splitLines(String(meta.refAudioUrls ?? ""));
+function collectRefs(ctx: CanvasNodeContext, meta: Record<string, unknown>): { images: RefSource[]; audios: RefSource[] } {
+    const images = splitLines(String(meta.refImageUrls ?? "")).map((url) => ({ url }));
+    const audios = splitLines(String(meta.refAudioUrls ?? "")).map((url) => ({ url }));
     for (const node of ctx.getUpstream()) {
         const url = typeof node.metadata?.content === "string" ? node.metadata.content : "";
         if (!url) continue;
         const kind = upstreamKind(node);
-        if (kind === "image" && images.length < MAX_REF_IMAGES && !images.includes(url)) images.push(url);
-        else if (kind === "audio" && audios.length < MAX_REF_AUDIOS && !audios.includes(url)) audios.push(url);
+        // storageKey 是宿主 IndexedDB 里的持久化键,blob: 地址失效后靠它兜底读取
+        const storageKey = typeof node.metadata?.storageKey === "string" ? node.metadata.storageKey : "";
+        const source = { url, storageKey };
+        if (kind === "image" && images.length < MAX_REF_IMAGES && !images.some((item) => item.url === url)) images.push(source);
+        else if (kind === "audio" && audios.length < MAX_REF_AUDIOS && !audios.some((item) => item.url === url)) audios.push(source);
     }
     return { images: images.slice(0, MAX_REF_IMAGES), audios: audios.slice(0, MAX_REF_AUDIOS) };
 }
@@ -191,6 +250,67 @@ function assembleBody(preset: WorkflowPreset | undefined, meta: Record<string, u
     if (preset?.lipSync && (!body.ref_audio_0 || !body.ref_image_0)) throw new Error("对口型工作流需要 1 条参考音频和 1 张参考图:连线上游或手动填写 URL");
     if (preset?.tts && !String(body.prompt_text ?? "").trim()) throw new Error("请填写要合成的文本");
     return body;
+}
+
+// ---------------------------------------------------------------------------
+// 工作流详情接口:GET /api/v1/comfyui/workflows/{id} 返回 input_rules
+// (必填/类型/MIME 白名单/数值范围/枚举),用于提交前的动态校验。
+// ---------------------------------------------------------------------------
+
+type InputRule = {
+    required?: boolean;
+    type?: string; // "image" | "audio" | "number" | "enum" | …
+    accept_types?: string[];
+    min?: number;
+    max?: number;
+    options?: Array<{ label: string }>;
+};
+
+async function fetchInputRules(apiBase: string, workflowId: string, token: string, signal: AbortSignal): Promise<Record<string, InputRule>> {
+    try {
+        const response = await fetch(`${apiBase}/api/v1/comfyui/workflows/${encodeURIComponent(workflowId)}`, { headers: { Authorization: token }, signal });
+        if (!response.ok) return {};
+        const payload = (await response.json().catch(() => null)) as { code?: string; data?: { input_rules?: Record<string, InputRule> } } | null;
+        if (payload?.code !== "Success" || !payload.data?.input_rules) return {};
+        return payload.data.input_rules;
+    } catch {
+        return {}; // 详情接口不可用时静默降级为本地预设校验
+    }
+}
+
+function mimeAllowed(url: string, rule: InputRule): boolean {
+    const accepts = rule.accept_types ?? [];
+    if (!accepts.length) return true;
+    const mime = url.startsWith("data:") ? mimeOfDataUrl(url) : "";
+    if (!mime) return true; // 远程 URL 无 MIME 信息时不预检
+    const family = `${mime.split("/")[0]}/*`;
+    return accepts.includes(mime) || accepts.includes(family);
+}
+
+// 按 input_rules 校验最终 body;返回错误文案或 null
+function validateWithRules(rules: Record<string, InputRule>, body: Record<string, unknown>): string | null {
+    for (const [name, rule] of Object.entries(rules)) {
+        const value = body[name];
+        const present = value !== undefined && value !== null && String(value).trim() !== "";
+        if (rule.required && !present) {
+            if (rule.type === "image") return `缺少必填的参考图(${name}):连线一个图片节点或在「手动参考图」里填 URL`;
+            if (rule.type === "audio") return `缺少必填的参考音频(${name}):连线一个音频节点或在「手动参考音频」里填 URL`;
+            return `缺少必填参数 ${name}`;
+        }
+        if (!present) continue;
+        if ((rule.type === "number") && typeof value === "number") {
+            if (rule.min !== undefined && value < rule.min) return `参数 ${name} 不能小于 ${rule.min}(当前 ${value})`;
+            if (rule.max !== undefined && value > rule.max) return `参数 ${name} 不能大于 ${rule.max}(当前 ${value})`;
+        }
+        if (rule.type === "enum" && rule.options?.length) {
+            const labels = rule.options.map((option) => option.label);
+            if (typeof value === "string" && labels.length && !labels.includes(value)) return `参数 ${name} 的值 "${value}" 不在可选列表:${labels.join("/")}`;
+        }
+        if ((rule.type === "image" || rule.type === "audio") && typeof value === "string" && !mimeAllowed(value, rule)) {
+            return `参考${rule.type === "image" ? "图" : "音频"}(${name})的格式不在支持列表:${rule.accept_types?.join("、")}`;
+        }
+    }
+    return null;
 }
 
 async function submitTask(apiBase: string, workflowId: string, body: Record<string, unknown>, token: string, signal: AbortSignal): Promise<string> {
@@ -264,8 +384,25 @@ async function runWorkflow(ctx: CanvasNodeContext) {
     runningByNode.set(nodeId, controller);
     ctx.updateMetadata({ status: "loading", errorDetails: undefined, progress: "准备中…" });
     try {
+        // 画布节点的 blob: 地址只在当前页面有效,先全部落地为可直接提交的地址
+        ctx.updateMetadata({ progress: "读取参考素材…" });
+        const rawRefs = collectRefs(ctx, meta);
+        const refs = { images: [] as string[], audios: [] as string[] };
+        for (const ref of rawRefs.images) refs.images.push(await refToDataUrl(ref, controller.signal));
+        for (const ref of rawRefs.audios) refs.audios.push(await refToDataUrl(ref, controller.signal));
+
         const preset = findPreset(workflowId);
-        const body = assembleBody(preset, meta, collectRefs(ctx, meta));
+        const body = assembleBody(preset, meta, refs);
+
+        // 详情接口校验(不可用时降级为本地预设规则)
+        ctx.updateMetadata({ progress: "校验参数…" });
+        const rules = await fetchInputRules(apiBase, workflowId, token, controller.signal);
+        if (controller.signal.aborted) return;
+        if (Object.keys(rules).length) {
+            const problem = validateWithRules(rules, body);
+            if (problem) throw new Error(problem);
+        }
+
         const taskId = await submitTask(apiBase, workflowId, body, token, controller.signal);
         ctx.updateMetadata({ taskId, progress: "排队中…" });
         const result = await pollResult(apiBase, taskId, token, controller.signal, (progress) => ctx.updateMetadata({ progress }));
@@ -555,6 +692,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                 <div style={{ ...s.hint, marginTop: 4 }}>
                   连线上游自动收集:当前已连图片 {upstreamStats.images} 张、音频 {upstreamStats.audios} 条,按连线顺序映射编号。
                   {preset?.firstLastFrame ? " 首尾帧取第 1、2 张图作 first/last_frame。" : ""}
+                  {" "}画布内素材(非公网 URL)会以 base64 内联提交,体积增大约 33%,大文件会略微增加提交耗时。
                 </div>
             ) : null}
 
@@ -601,7 +739,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.1.1",
+    version: "1.2.0",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [
