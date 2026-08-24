@@ -1,6 +1,6 @@
 {
     "name": "canvas-plugin-comfyui-autodl",
-    "version": "1.1.1",
+    "version": "1.2.0",
     "private": true,
     "type": "module",
     "description": "Infinite Canvas AutoDL.Art ComfyUI 工作流节点插件",
@@ -10,8 +10,9 @@
         "typecheck": "tsc --noEmit"
     },
     "devDependencies": {
-        "@infinite-canvas/plugin-sdk": "file:../sdk",
+        "@infinite-canvas/plugin-sdk": "file:../infinite-canvas/plugins/canvas/sdk",
         "@types/react": "19.1.12",
+        "localforage": "^1.10.0",
         "typescript": "^5"
     }
 }
