@@ -86,6 +86,8 @@ const PARAM_LABELS: Record<string, string> = {
     emo_disgusted: "厌恶",
     emo_surprised: "惊讶",
     emo_melancholic: "忧郁",
+    first_frame: "首帧",
+    last_frame: "尾帧",
 };
 
 function paramLabel(name: string): string {
@@ -98,6 +100,7 @@ function paramLabel(name: string): string {
 //   workflowId 工作流 ID;paramsJson 额外请求参数(JSON,优先级最高)
 //   wfDuration/wfResolution/wfSeed/wfAudioDuration 结构化参数
 //   refImageUrls/refAudioUrls 手动参考素材 URL(每行一个,排在上游连线之前)
+//   slotUrls 命名素材槽位的手动覆盖(如 first_frame/last_frame,优先级最高)
 //   resultKind 最终结果类型。Token 与 API Base 存 ctx.storage。
 // ---------------------------------------------------------------------------
 
@@ -130,6 +133,8 @@ function msgSuffix(payload: unknown): string {
 const IMAGE_EXT = /\.(png|jpe?g|webp|gif|bmp)(\?|#|$)/i;
 const VIDEO_EXT = /\.(mp4|webm|mov|m4v)(\?|#|$)/i;
 const AUDIO_EXT = /\.(mp3|wav|flac|m4a|aac|ogg)(\?|#|$)/i;
+// 通用编号槽位(按顺序自动分配);不匹配的视为命名槽位,提供独立输入框
+const GENERIC_SLOT_NAME = /^ref_(image|audio)_\d+$/;
 
 // ---------------------------------------------------------------------------
 // 参考素材落地:画布节点的 blob:/data: 地址只在当前浏览器有效,直接提交会被
@@ -264,8 +269,14 @@ function assembleBody(preset: WorkflowPreset | undefined, meta: Record<string, u
         if (preset?.seed && String(meta.wfSeed ?? "").trim()) body.seed = parseIntField(String(meta.wfSeed), "seed");
         if (preset?.audioDuration && String(meta.wfAudioDuration ?? "").trim()) body.audio_duration = clamp(parseIntField(String(meta.wfAudioDuration), "音频时长"), { min: 1, max: 15 });
         if (preset?.firstLastFrame) {
-            if (refs.images[0]) body.first_frame = refs.images[0];
-            if (refs.images[1]) body.last_frame = refs.images[1];
+            // 命名槽位覆盖优先(面板「首帧/尾帧」输入框),否则按连线顺序取前两张
+            const frameOverrides = meta.slotUrls && typeof meta.slotUrls === "object" ? (meta.slotUrls as Record<string, unknown>) : {};
+            const firstOverride = String(frameOverrides.first_frame ?? "").trim();
+            const lastOverride = String(frameOverrides.last_frame ?? "").trim();
+            if (firstOverride) body.first_frame = firstOverride;
+            else if (refs.images[0]) body.first_frame = refs.images[0];
+            if (lastOverride) body.last_frame = lastOverride;
+            else if (refs.images[1]) body.last_frame = refs.images[1];
         } else {
             if (preset?.refImages) refs.images.forEach((url, index) => (body[`ref_image_${index}`] = url));
             if (preset?.refAudios) refs.audios.forEach((url, index) => (body[`ref_audio_${index}`] = url));
@@ -364,7 +375,14 @@ async function collectRefsForRules(
 
     const filled: Array<{ name: string; source: { url: string; storageKey?: string } }> = [];
     const usedUrl = new Set<string>();
+    // 命名槽位手动覆盖(如 first_frame/last_frame):优先级高于手动列表与连线
+    const slotOverrides = meta.slotUrls && typeof meta.slotUrls === "object" ? (meta.slotUrls as Record<string, unknown>) : {};
     for (const slot of slots) {
+        const override = String(slotOverrides[slot.name] ?? "").trim();
+        if (override) {
+            filled.push({ name: slot.name, source: { url: override } });
+            continue;
+        }
         // 手动 URL 优先占同类型槽位
         const manualQueue = slot.kind === "image" ? manualImages : manualAudios;
         while (manualQueue.length && filled.length < slots.length) {
@@ -741,6 +759,339 @@ function ui(ctx: CanvasNodeContext) {
     };
 }
 
+// ---------------------------------------------------------------------------
+// @ 素材引用输入框:移植宿主 CanvasPromptChipInput 的核心交互(contentEditable +
+// 内联缩略图 chip + @ 自动补全菜单 + 点击看大图)。值仍序列化为纯文本(含 @标签),
+// 与原 textarea 语义一致;提交前由 runWorkflow 剥离标签。
+// ---------------------------------------------------------------------------
+
+type MentionItem = { token: string; title: string; kind: "image" | "audio"; url: string };
+
+function parseMentionTokens(value: string, labels: string[]): Array<{ type: "text"; value: string } | { type: "ref"; label: string }> {
+    if (!labels.length) return value ? [{ type: "text", value }] : [];
+    const escaped = labels.map((label) => label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+    const tokens: Array<{ type: "text"; value: string } | { type: "ref"; label: string }> = [];
+    let lastIndex = 0;
+    for (const match of value.matchAll(new RegExp(`(${escaped})`, "g"))) {
+        if (match.index === undefined) continue;
+        if (match.index > lastIndex) tokens.push({ type: "text", value: value.slice(lastIndex, match.index) });
+        tokens.push({ type: "ref", label: match[0] });
+        lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < value.length) tokens.push({ type: "text", value: value.slice(lastIndex) });
+    return tokens;
+}
+
+function serializeEditor(editor: HTMLElement): string {
+    let result = "";
+    editor.childNodes.forEach((node) => {
+        if (node.nodeType === Node.TEXT_NODE) {
+            result += node.textContent || "";
+            return;
+        }
+        if (!(node instanceof HTMLElement)) return;
+        const label = node.dataset.refLabel;
+        if (label) result += label;
+        else if (node.tagName === "BR") result += "\n";
+        else result += serializeEditor(node);
+    });
+    return result;
+}
+
+function createChip(item: MentionItem, ctx: CanvasNodeContext, onPreview: (url: string) => void): HTMLElement {
+    const wrapper = document.createElement("span");
+    wrapper.contentEditable = "false";
+    wrapper.dataset.refLabel = item.token;
+    if (item.kind === "image" && item.url) {
+        const img = document.createElement("img");
+        img.src = item.url;
+        img.alt = item.title;
+        img.draggable = false;
+        img.style.cssText = "width:22px;height:22px;border-radius:6px;object-fit:cover;display:block;";
+        wrapper.style.cssText = "display:inline-flex;width:22px;height:22px;overflow:hidden;border-radius:6px;vertical-align:middle;margin:0 1px;cursor:pointer;";
+        wrapper.title = `${item.token} · ${item.title}(点击预览)`;
+        wrapper.appendChild(img);
+        wrapper.addEventListener("click", (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            onPreview(item.url);
+        });
+    } else {
+        wrapper.style.cssText = `display:inline-flex;height:22px;max-width:160px;align-items:center;overflow:hidden;border-radius:6px;border:1px solid ${ctx.theme.toolbar.border};background:${ctx.theme.toolbar.panel};color:${ctx.theme.node.text};font-size:11px;line-height:20px;padding:0 5px;vertical-align:middle;margin:0 1px;`;
+        wrapper.title = `${item.token} · ${item.title}`;
+        const text = document.createElement("span");
+        text.textContent = item.kind === "audio" ? `🔊${item.token}` : item.token;
+        text.style.cssText = "white-space:nowrap;overflow:hidden;text-overflow:ellipsis;display:block;";
+        wrapper.appendChild(text);
+    }
+    return wrapper;
+}
+
+function MentionPromptInput({ value, onChange, items, ctx, style, placeholder }: { value: string; onChange: (next: string) => void; items: MentionItem[]; ctx: CanvasNodeContext; style?: CSSProperties; placeholder?: string }) {
+    const wrapRef = useRef<HTMLDivElement | null>(null);
+    const editorRef = useRef<HTMLDivElement | null>(null);
+    const lastEmittedRef = useRef(value);
+    const composingRef = useRef(false);
+    const [menu, setMenu] = useState<{ query: string; left: number; top: number } | null>(null);
+    const [activeIndex, setActiveIndex] = useState(0);
+    const [previewUrl, setPreviewUrl] = useState<string | null>(null);
+
+    // 标签按长度降序匹配,避免 @图片1 拆散 @图片10
+    const labelsSorted = Array.from(new Set(items.map((item) => item.token))).sort((a, b) => b.length - a.length);
+    const byLabel = new Map(items.map((item) => [item.token, item]));
+    const candidates = menu
+        ? (() => {
+              const query = menu.query.trim().toLowerCase();
+              return query ? items.filter((item) => `${item.token} ${item.title}`.toLowerCase().includes(query)) : items;
+          })()
+        : [];
+
+    function rebuild() {
+        const editor = editorRef.current;
+        if (!editor) return;
+        editor.textContent = "";
+        for (const token of parseMentionTokens(value, labelsSorted)) {
+            if (token.type === "text") editor.append(document.createTextNode(token.value));
+            else {
+                const item = byLabel.get(token.label);
+                editor.append(item ? createChip(item, ctx, setPreviewUrl) : document.createTextNode(token.label));
+            }
+        }
+    }
+
+    function closeMenu() {
+        setMenu(null);
+        setActiveIndex(0);
+    }
+
+    function emitNext(next: string) {
+        lastEmittedRef.current = next;
+        onChange(next);
+    }
+
+    function caretBox(): { left: number; top: number } {
+        const wrap = wrapRef.current;
+        const selection = window.getSelection();
+        if (!wrap || !selection?.rangeCount) return { left: 8, top: 4 };
+        const range = selection.getRangeAt(0).cloneRange();
+        range.collapse(true);
+        const rect = range.getBoundingClientRect();
+        const base = wrap.getBoundingClientRect();
+        if (!(rect.width || rect.height || rect.left || rect.top)) return { left: 8, top: base.height + 6 };
+        return {
+            left: Math.min(Math.max(rect.left - base.left, 4), Math.max(base.width - 190, 4)),
+            top: rect.bottom - base.top + 6,
+        };
+    }
+
+    function syncMention() {
+        const editor = editorRef.current;
+        const selection = window.getSelection();
+        if (!editor || !selection?.rangeCount || !items.length) {
+            closeMenu();
+            return;
+        }
+        const range = selection.getRangeAt(0);
+        if (!range.collapsed) {
+            closeMenu();
+            return;
+        }
+        const probe = document.createRange();
+        probe.selectNodeContents(editor);
+        try {
+            probe.setEnd(range.startContainer, range.startOffset);
+        } catch {
+            closeMenu();
+            return;
+        }
+        const match = /@([^\s@]*)$/.exec(probe.toString());
+        if (!match) {
+            closeMenu();
+            return;
+        }
+        const box = caretBox();
+        setMenu({ query: match[1] || "", left: box.left, top: box.top });
+        setActiveIndex(0);
+    }
+
+    function insertChip(item: MentionItem) {
+        const editor = editorRef.current;
+        const selection = window.getSelection();
+        if (!editor) return;
+        // 删除光标前未完成的 @query 文本
+        if (selection?.rangeCount) {
+            const range = selection.getRangeAt(0);
+            const probe = document.createRange();
+            probe.selectNodeContents(editor);
+            probe.setEnd(range.startContainer, range.startOffset);
+            const match = /@([^\s@]*)$/.exec(probe.toString());
+            if (match && range.startContainer.nodeType === Node.TEXT_NODE) {
+                range.setStart(range.startContainer, Math.max(0, range.startOffset - match[0].length));
+                range.deleteContents();
+            }
+        }
+        const chip = createChip(item, ctx, setPreviewUrl);
+        const space = document.createTextNode(" ");
+        if (selection?.rangeCount) {
+            const range = selection.getRangeAt(0);
+            range.insertNode(space);
+            range.insertNode(chip);
+            range.setStartAfter(space);
+            range.collapse(true);
+            selection.removeAllRanges();
+            selection.addRange(range);
+        } else {
+            editor.append(chip, space);
+        }
+        closeMenu();
+        emitNext(serializeEditor(editor));
+    }
+
+    // chip 是原子块:紧邻的 Backspace/Delete 整块删除
+    function deleteAdjacentChip(key: "Backspace" | "Delete"): boolean {
+        const selection = window.getSelection();
+        if (!selection?.rangeCount || !selection.isCollapsed) return false;
+        const range = selection.getRangeAt(0);
+        const container = range.startContainer;
+        const offset = range.startOffset;
+        let target: Node | null = null;
+        if (container.nodeType === Node.TEXT_NODE) {
+            const insideText = key === "Backspace" ? offset > 0 : offset < (container.textContent || "").length;
+            if (insideText) return false;
+            target = key === "Backspace" ? container.previousSibling : container.nextSibling;
+        } else if (container instanceof HTMLElement) {
+            const children = Array.from(container.childNodes);
+            target = children[key === "Backspace" ? offset - 1 : offset] ?? null;
+        }
+        while (target && target.nodeType === Node.TEXT_NODE && !(target.textContent || "").trim()) {
+            target = key === "Backspace" ? target.previousSibling : target.nextSibling;
+        }
+        if (!(target instanceof HTMLElement) || !target.dataset.refLabel) return false;
+        const marker = document.createTextNode("");
+        target.replaceWith(marker);
+        range.setStart(marker, 0);
+        range.collapse(true);
+        selection.removeAllRanges();
+        selection.addRange(range);
+        return true;
+    }
+
+    // 外部值变化(或失焦态回显)时重建 DOM;自身输入的回显不重建,避免丢光标/打断输入法
+    useEffect(() => {
+        const editor = editorRef.current;
+        if (!editor) return;
+        if (document.activeElement === editor && value === lastEmittedRef.current) return;
+        rebuild();
+        lastEmittedRef.current = value;
+    });
+
+    return (
+        <div ref={wrapRef} style={{ position: "relative", width: "100%" }} data-canvas-no-zoom>
+            {!value.trim() && placeholder ? (
+                <div style={{ position: "absolute", left: 6, top: 8, fontSize: 13, lineHeight: 1.5, color: ctx.theme.node.placeholder, pointerEvents: "none" }}>{placeholder}</div>
+            ) : null}
+            <div
+                ref={editorRef}
+                contentEditable
+                suppressContentEditableWarning
+                role="textbox"
+                aria-multiline="true"
+                spellCheck={false}
+                style={{ ...style, cursor: "text", overflowY: "auto", maxHeight: 200, wordBreak: "break-word", whiteSpace: "pre-wrap" }}
+                onMouseDown={(e) => e.stopPropagation()}
+                onWheel={(e) => e.stopPropagation()}
+                onInput={() => {
+                    if (composingRef.current || !editorRef.current) return;
+                    emitNext(serializeEditor(editorRef.current));
+                    syncMention();
+                }}
+                onCompositionStart={() => {
+                    composingRef.current = true;
+                }}
+                onCompositionEnd={() => {
+                    composingRef.current = false;
+                    if (!editorRef.current) return;
+                    emitNext(serializeEditor(editorRef.current));
+                    syncMention();
+                }}
+                onKeyDown={(e) => {
+                    e.stopPropagation();
+                    if (composingRef.current) return;
+                    if (menu && candidates.length) {
+                        if (e.key === "ArrowDown") {
+                            e.preventDefault();
+                            setActiveIndex((index) => (index + 1) % candidates.length);
+                            return;
+                        }
+                        if (e.key === "ArrowUp") {
+                            e.preventDefault();
+                            setActiveIndex((index) => (index - 1 + candidates.length) % candidates.length);
+                            return;
+                        }
+                        if (e.key === "Enter") {
+                            e.preventDefault();
+                            insertChip(candidates[Math.min(activeIndex, candidates.length - 1)]);
+                            return;
+                        }
+                        if (e.key === "Escape") {
+                            e.preventDefault();
+                            closeMenu();
+                            return;
+                        }
+                    }
+                    if ((e.key === "Backspace" || e.key === "Delete") && deleteAdjacentChip(e.key)) {
+                        e.preventDefault();
+                        requestAnimationFrame(() => {
+                            if (!editorRef.current) return;
+                            emitNext(serializeEditor(editorRef.current));
+                            syncMention();
+                        });
+                        return;
+                    }
+                    requestAnimationFrame(syncMention);
+                }}
+                onBlur={() => window.setTimeout(closeMenu, 150)}
+            />
+            {menu && candidates.length ? (
+                <div
+                    onMouseDown={(e) => e.stopPropagation()}
+                    style={{ position: "absolute", zIndex: 60, left: menu.left, top: menu.top, width: 230, maxHeight: 192, overflowY: "auto", borderRadius: 12, border: `1px solid ${ctx.theme.toolbar.border}`, background: ctx.theme.toolbar.panel, boxShadow: "0 16px 32px -8px rgba(0,0,0,.35)", padding: 4 }}
+                >
+                    {candidates.map((item, index) => (
+                        <div
+                            key={item.token}
+                            role="button"
+                            ref={index === activeIndex ? (el) => el?.scrollIntoView({ block: "nearest" }) : undefined}
+                            onMouseDown={(e) => {
+                                e.preventDefault();
+                                e.stopPropagation();
+                                insertChip(item);
+                            }}
+                            onMouseEnter={() => setActiveIndex(index)}
+                            style={{ display: "flex", alignItems: "center", gap: 8, padding: "4px 8px", borderRadius: 8, cursor: "pointer", background: index === activeIndex ? ctx.theme.toolbar.border : "transparent", color: ctx.theme.node.text, fontSize: 12 }}
+                        >
+                            {item.kind === "image" && item.url ? (
+                                <img src={item.url} alt="" draggable={false} style={{ width: 30, height: 30, borderRadius: 6, objectFit: "cover", flexShrink: 0 }} />
+                            ) : (
+                                <span style={{ width: 30, height: 30, borderRadius: 6, background: "rgba(127,127,127,.18)", display: "grid", placeItems: "center", flexShrink: 0, fontSize: 13 }}>🔊</span>
+                            )}
+                            <span style={{ minWidth: 0 }}>
+                                <span style={{ display: "block", fontWeight: 500 }}>{item.token}</span>
+                                <span style={{ display: "block", opacity: 0.65, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", maxWidth: 160 }}>{item.title}</span>
+                            </span>
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+            {previewUrl ? (
+                <div onClick={() => setPreviewUrl(null)} style={{ position: "fixed", inset: 0, zIndex: 1100, background: "rgba(0,0,0,.72)", display: "flex", alignItems: "center", justifyContent: "center", cursor: "zoom-out" }}>
+                    <img src={previewUrl} alt="" style={{ maxWidth: "82vw", maxHeight: "82vh", borderRadius: 12, boxShadow: "0 24px 64px rgba(0,0,0,.5)" }} />
+                </div>
+            ) : null}
+        </div>
+    );
+}
+
 function WorkflowContent({ ctx }: CanvasNodeContentProps) {
     const meta = ctx.node.metadata ?? {};
     const url = typeof meta.content === "string" ? meta.content : "";
@@ -809,6 +1160,15 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
             return {};
         }
     });
+    // 命名素材槽位的手动覆盖值(优先级高于手动列表与上游连线)
+    const [slotUrls, setSlotUrls] = useState<Record<string, string>>(() => {
+        try {
+            const raw = meta.slotUrls;
+            return raw && typeof raw === "object" ? (raw as Record<string, string>) : {};
+        } catch {
+            return {};
+        }
+    });
     const [paramsJson, setParamsJson] = useState(() => String(meta.paramsJson ?? ""));
     const [resultKind, setResultKind] = useState<ResultKind>(() => ((typeof meta.resultKind === "string" && meta.resultKind) as ResultKind) || "auto");
     const [tokenDraft, setTokenDraft] = useState("");
@@ -816,7 +1176,6 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
     const [advancedOpen, setAdvancedOpen] = useState(false);
     const [refreshNote, setRefreshNote] = useState("");
-    const promptRef = useRef<HTMLTextAreaElement | null>(null);
 
     const preset = findPreset(workflowId);
     const dynamicEntry = findDynamic(catalog, workflowId);
@@ -922,9 +1281,28 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
         : [];
     const tokenMissing = tokenLoaded && !tokenDraft.trim();
 
+    // 命名素材槽位:动态规则里非通用编号的 image/audio 槽(如 first_frame/last_frame),
+    // 以及离线降级时的首尾帧预设。通用 ref_image_N/ref_audio_N 仍按顺序自动分配。
+    const namedAssetSlots: Array<{ name: string; kind: "image" | "audio"; required: boolean }> = usingDynamic
+        ? Object.entries(activeRules)
+              .filter(([name, rule]) => ruleAcceptsKind(rule) !== null && !GENERIC_SLOT_NAME.test(name))
+              .map(([name, rule]) => ({ name, kind: ruleAcceptsKind(rule) as "image" | "audio", required: Boolean(rule.required) }))
+        : preset?.firstLastFrame
+          ? [
+                { name: "first_frame", kind: "image" as const, required: true },
+                { name: "last_frame", kind: "image" as const, required: true },
+            ]
+          : [];
+    const setSlotUrl = (name: string, next: string) =>
+        setSlotUrls((prev) => {
+            const merged = { ...prev, [name]: next };
+            patch({ slotUrls: merged });
+            return merged;
+        });
+
     // @ 素材引用:上游连线素材按连线顺序编号,标签与提交时的槽位顺序一致(图片1→ref_image_0)
     const mentionables = (() => {
-        const items: Array<{ token: string; title: string }> = [];
+        const items: Array<{ token: string; title: string; kind: "image" | "audio"; url: string }> = [];
         let imageIndex = 0;
         let audioIndex = 0;
         for (const node of ctx.getUpstream()) {
@@ -933,10 +1311,10 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
             if (kind === "other" || !url) continue;
             if (kind === "image") {
                 imageIndex += 1;
-                items.push({ token: `@图片${imageIndex}`, title: node.title || `图片${imageIndex}` });
+                items.push({ token: `@图片${imageIndex}`, title: node.title || `图片${imageIndex}`, kind: "image", url });
             } else if (kind === "audio") {
                 audioIndex += 1;
-                items.push({ token: `@音频${audioIndex}`, title: node.title || `音频${audioIndex}` });
+                items.push({ token: `@音频${audioIndex}`, title: node.title || `音频${audioIndex}`, kind: "audio", url });
             }
         }
         return items;
@@ -945,26 +1323,11 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
         ? Object.keys(activeRules).some((name) => name === "prompt" || (activeRules[name]?.type === "string" && name === "prompt_text"))
         : Boolean(!preset || preset.hasPrompt || preset.tts);
 
-    // 把 @ 标签插入提示词光标处
-    const insertMention = (token: string) => {
-        const el = promptRef.current;
-        const base = prompt;
-        if (!el) {
-            const next = `${base}${base && !base.endsWith(" ") ? " " : ""}${token} `;
-            setPrompt(next);
-            patch({ prompt: next });
-            return;
-        }
-        const start = el.selectionStart ?? base.length;
-        const end = el.selectionEnd ?? start;
-        const next = `${base.slice(0, start)}${token} ${base.slice(end)}`;
+    // 「引用素材」行点按:把标签追加到提示词末尾(光标处插入由输入框内的 @ 自动补全负责)
+    const appendMention = (token: string) => {
+        const next = `${prompt}${prompt && !prompt.endsWith(" ") ? " " : ""}${token} `;
         setPrompt(next);
         patch({ prompt: next });
-        requestAnimationFrame(() => {
-            el.focus();
-            const pos = start + token.length + 1;
-            el.setSelectionRange(pos, pos);
-        });
     };
 
     return (
@@ -1030,10 +1393,15 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                             role="button"
                             title={item.title}
                             onMouseDown={(e) => e.stopPropagation()}
-                            onClick={() => insertMention(item.token)}
-                            style={{ cursor: "pointer", fontSize: 11, padding: "2px 8px", borderRadius: 999, border: `1px solid ${ctx.theme.toolbar.border}`, userSelect: "none" }}
+                            onClick={() => appendMention(item.token)}
+                            style={{ cursor: "pointer", display: "inline-flex", alignItems: "center", gap: 5, padding: "2px 8px 2px 2px", borderRadius: 999, border: `1px solid ${ctx.theme.toolbar.border}`, userSelect: "none", fontSize: 11, maxWidth: 180 }}
                         >
-                            {item.token}
+                            {item.kind === "image" && item.url ? (
+                                <img src={item.url} alt="" draggable={false} style={{ width: 22, height: 22, borderRadius: 999, objectFit: "cover", flexShrink: 0 }} />
+                            ) : (
+                                <span style={{ width: 22, height: 22, borderRadius: 999, background: "rgba(127,127,127,.18)", display: "inline-flex", alignItems: "center", justifyContent: "center", fontSize: 10, flexShrink: 0 }}>🔊</span>
+                            )}
+                            <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{item.kind === "audio" ? `🔊${item.token}` : item.token}</span>
                         </span>
                     ))}
                 </div>
@@ -1045,14 +1413,13 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                     {Object.entries(activeRules).filter(([name, rule]) => name === "prompt" || (rule.type === "string" && name === "prompt_text")).map(([name, rule]) => (
                         <div key={name}>
                             <label style={s.label}>{name === "prompt" ? "提示词" : `${name}(文本)`}{rule.required ? " *" : ""}</label>
-                            <textarea
-                                ref={promptRef}
+                            <MentionPromptInput
                                 value={prompt}
-                                maxLength={typeof rule.max_length === "number" ? rule.max_length : undefined}
-                                placeholder={name === "prompt" ? "描述主体、动作、场景、镜头…" : `输入 ${name}`}
-                                onWheel={(e) => e.stopPropagation()}
-                                onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }}
+                                onChange={(next) => { setPrompt(next); patch({ prompt: next }); }}
+                                items={mentionables}
+                                ctx={ctx}
                                 style={s.prompt}
+                                placeholder={name === "prompt" ? "描述主体、动作、场景、镜头…,输入 @ 引用素材" : `输入 ${name},支持 @ 素材`}
                             />
                         </div>
                     ))}
@@ -1105,13 +1472,13 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
             {(!preset || preset.hasPrompt) && !preset?.tts ? (
                 <>
                     <label style={s.label}>提示词</label>
-                    <textarea ref={promptRef} value={prompt} placeholder="描述主体、动作、场景、镜头…" onWheel={(e) => e.stopPropagation()} onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }} style={s.prompt} />
+                    <MentionPromptInput value={prompt} onChange={(next) => { setPrompt(next); patch({ prompt: next }); }} items={mentionables} ctx={ctx} style={s.prompt} placeholder="描述主体、动作、场景、镜头…,输入 @ 引用素材" />
                 </>
             ) : null}
             {preset?.tts ? (
                 <>
                     <label style={s.label}>合成文本(prompt_text)</label>
-                    <textarea ref={promptRef} value={prompt} placeholder="要朗读的文本…" onWheel={(e) => e.stopPropagation()} onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }} style={s.prompt} />
+                    <MentionPromptInput value={prompt} onChange={(next) => { setPrompt(next); patch({ prompt: next }); }} items={mentionables} ctx={ctx} style={s.prompt} placeholder="要朗读的文本…" />
                 </>
             ) : null}
                 </>
@@ -1150,6 +1517,21 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                 </div>
             ) : null}
 
+            {/* 命名素材槽位(首帧/尾帧等):可连线自动分配,也可填 URL 显式覆盖 */}
+            {namedAssetSlots.length ? (
+                <div style={s.row}>
+                    {namedAssetSlots.map((slot) => (
+                        <div key={slot.name} style={s.cell}>
+                            <label style={s.label} title={slot.name}>
+                                {paramLabel(slot.name)}({slot.name})
+                                {slot.required ? " *" : ""}
+                            </label>
+                            <input value={slotUrls[slot.name] ?? ""} placeholder="连线自动分配;填图片/音频 URL 覆盖" onChange={(e) => setSlotUrl(slot.name, e.target.value)} style={s.pill} />
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+
             {showRefImages ? (
                 <>
                     <label style={s.label}>手动参考图 URL(每行一个,排在连线之前)</label>
@@ -1165,7 +1547,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
             {showRefImages || showRefAudios ? (
                 <div style={{ ...s.hint, marginTop: 4 }}>
                   连线上游自动收集:当前已连图片 {upstreamStats.images} 张、音频 {upstreamStats.audios} 条,按连线顺序映射编号。
-                  {preset?.firstLastFrame ? " 首尾帧取第 1、2 张图作 first/last_frame。" : ""}
+                  {preset?.firstLastFrame || namedAssetSlots.some((slot) => slot.name === "first_frame") ? " 首尾帧未手动填 URL 时,取第 1、2 张连线图作 first/last_frame。" : ""}
                   {" "}画布内素材(非公网 URL)会以 base64 内联提交,体积增大约 33%,大文件会略微增加提交耗时。
                 </div>
             ) : null}
@@ -1213,7 +1595,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.3.3",
+    version: "1.4.0",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [

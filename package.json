@@ -1,6 +1,6 @@
 {
     "name": "canvas-plugin-comfyui-autodl",
-    "version": "1.3.3",
+    "version": "1.4.0",
     "private": true,
     "type": "module",
     "description": "Infinite Canvas AutoDL.Art ComfyUI 工作流节点插件",
