@@ -3,7 +3,7 @@
 // 参考图片/音频从上游连线节点按顺序自动收集(也可手动填 URL),提交任务并轮询结果写回节点。
 // 面板视觉对齐宿主官方面板(canvas-node-prompt-panel)的设计语言。
 // API 文档: https://autodl.art/docs/comfyui_api/
-import { definePlugin, useEffect, useState } from "@infinite-canvas/plugin-sdk";
+import { definePlugin, useEffect, useRef, useState } from "@infinite-canvas/plugin-sdk";
 import localforage from "localforage";
 import type { CSSProperties } from "react";
 import type { CanvasNodeContentProps, CanvasNodeContext, CanvasNodeData, CanvasNodePanelProps, CanvasNodeResource } from "@infinite-canvas/plugin-sdk";
@@ -485,7 +485,7 @@ async function fetchJson<T>(url: string, token: string | null, signal: AbortSign
 async function loadCatalog(apiBase: string, token: string, storage: PluginStorage, signal: AbortSignal): Promise<WorkflowCatalog> {
     const cached = await storage.get<WorkflowCatalog>("catalog");
     const fresh = cached && Date.now() - cached.fetchedAt < CATALOG_TTL_MS && cached.workflows.length > 0 ? cached : null;
-    const listData = await fetchJson<Array<{ uuid: string; name: string; description?: string }>>(`${apiBase}/api/v1/comfyui/workflows`, token || null, signal);
+    const listData = await fetchJson<Array<{ uuid: string; name: string; description?: string }>>(`${apiBase}/api/v1/comfyui/workflows`, token || null, signal, { method: "POST", jsonBody: "{}" });
     if (!listData?.length) {
         if (fresh) return fresh;
         // 网络失败且无缓存 → 内置预设兜底(标记 fetchedAt=0,UI 提示为「内置预设」)
@@ -594,7 +594,9 @@ async function runWorkflow(ctx: CanvasNodeContext) {
 
         const refs = await collectRefsForRules(ctx, meta, rules, preset, controller.signal);
 
-        const body = assembleBody(preset, meta, refs);
+        // @图片N/@音频N 只是描述时的指代标签,服务端不解析,提交前剥离
+        const submitMeta = { ...meta, prompt: String(meta.prompt ?? "").replace(/@(?:图片|音频)\d+/g, " ").replace(/\s{2,}/g, " ").trim() };
+        const body = assembleBody(preset, submitMeta, refs);
         // 动态表单值(paramsDyn)按规则类型并入请求体:number/boolean 转型,其余字符串
         if (dynamic && meta.paramsDyn && typeof meta.paramsDyn === "object") {
             for (const [name, rawValue] of Object.entries(meta.paramsDyn as Record<string, string>)) {
@@ -811,6 +813,8 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     const [tokenLoaded, setTokenLoaded] = useState(false);
     const [apiBase, setApiBase] = useState(DEFAULT_API_BASE);
     const [advancedOpen, setAdvancedOpen] = useState(false);
+    const [refreshNote, setRefreshNote] = useState("");
+    const promptRef = useRef<HTMLTextAreaElement | null>(null);
 
     const preset = findPreset(workflowId);
     const dynamicEntry = findDynamic(catalog, workflowId);
@@ -884,6 +888,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
         const api = apiBase.trim() || DEFAULT_API_BASE;
         const next = await loadCatalog(api, token, ctx.storage, controller.signal);
         setCatalog(next);
+        setRefreshNote(next.fetchedAt ? `已更新:${next.workflows.length} 个工作流` : "刷新失败:无法连接 AutoDL");
         if (workflowId) {
             const nextRules = await loadRules(api, workflowId, token || "anonymous", ctx.storage, controller.signal);
             if (Object.keys(nextRules).length) setRules(nextRules);
@@ -915,11 +920,56 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
         : [];
     const tokenMissing = tokenLoaded && !tokenDraft.trim();
 
+    // @ 素材引用:上游连线素材按连线顺序编号,标签与提交时的槽位顺序一致(图片1→ref_image_0)
+    const mentionables = (() => {
+        const items: Array<{ token: string; title: string }> = [];
+        let imageIndex = 0;
+        let audioIndex = 0;
+        for (const node of ctx.getUpstream()) {
+            const kind = upstreamKind(node);
+            const url = typeof node.metadata?.content === "string" ? node.metadata.content : "";
+            if (kind === "other" || !url) continue;
+            if (kind === "image") {
+                imageIndex += 1;
+                items.push({ token: `@图片${imageIndex}`, title: node.title || `图片${imageIndex}` });
+            } else if (kind === "audio") {
+                audioIndex += 1;
+                items.push({ token: `@音频${audioIndex}`, title: node.title || `音频${audioIndex}` });
+            }
+        }
+        return items;
+    })();
+    const showPromptArea = usingDynamic
+        ? Object.keys(activeRules).some((name) => name === "prompt" || (activeRules[name]?.type === "string" && name === "prompt_text"))
+        : Boolean(!preset || preset.hasPrompt || preset.tts);
+
+    // 把 @ 标签插入提示词光标处
+    const insertMention = (token: string) => {
+        const el = promptRef.current;
+        const base = prompt;
+        if (!el) {
+            const next = `${base}${base && !base.endsWith(" ") ? " " : ""}${token} `;
+            setPrompt(next);
+            patch({ prompt: next });
+            return;
+        }
+        const start = el.selectionStart ?? base.length;
+        const end = el.selectionEnd ?? start;
+        const next = `${base.slice(0, start)}${token} ${base.slice(end)}`;
+        setPrompt(next);
+        patch({ prompt: next });
+        requestAnimationFrame(() => {
+            el.focus();
+            const pos = start + token.length + 1;
+            el.setSelectionRange(pos, pos);
+        });
+    };
+
     return (
         <div data-canvas-no-zoom className={`ca-autodl ${isDarkTheme(ctx.theme) ? "ca-autodl-dark" : "ca-autodl-light"}`} onMouseDown={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()} style={s.card}>
             <div style={s.row}>
                 <div style={{ ...s.cell, flex: "2 1 60%" }}>
-                    <label style={s.label}>工作流 · {catalog ? (catalog.fetchedAt ? "官方动态列表" : "内置预设(离线)") : "加载中…"}</label>
+                    <label style={s.label}>工作流 · {catalog ? (catalog.fetchedAt ? "官方动态列表" : "内置预设(离线)") : "加载中…"}{refreshNote ? ` · ${refreshNote}` : ""}</label>
                     <select value={workflowId} onChange={(e) => selectWorkflow(e.target.value)} style={s.pill}>
                         <option value="">自定义(手填 ID)</option>
                         {(catalog?.workflows ?? WORKFLOWS.map((preset) => ({ id: preset.id, label: preset.label }))).map((item) => (
@@ -965,6 +1015,28 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                 </>
             ) : null}
 
+            {/* @ 素材引用:点按插入标签,提交时自动剥离;素材本身走 ref 槽位 */}
+            {showPromptArea && mentionables.length ? (
+                <div
+                    title={`@标签仅用于描述时指代素材,提交时自动从提示词移除;素材通过 ${usingDynamic ? "规则槽位" : "ref_image_N/ref_audio_N"} 传入工作流`}
+                    style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center", marginTop: 8 }}
+                >
+                    <span style={{ fontSize: 11, opacity: 0.55 }}>引用素材:</span>
+                    {mentionables.map((item) => (
+                        <span
+                            key={item.token}
+                            role="button"
+                            title={item.title}
+                            onMouseDown={(e) => e.stopPropagation()}
+                            onClick={() => insertMention(item.token)}
+                            style={{ cursor: "pointer", fontSize: 11, padding: "2px 8px", borderRadius: 999, border: `1px solid ${ctx.theme.toolbar.border}`, userSelect: "none" }}
+                        >
+                            {item.token}
+                        </span>
+                    ))}
+                </div>
+            ) : null}
+
             {/* 动态参数区:按 input_rules 渲染 prompt/string/number/boolean/enum 控件 */}
             {usingDynamic ? (
                 <>
@@ -972,6 +1044,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                         <div key={name}>
                             <label style={s.label}>{name === "prompt" ? "提示词" : `${name}(文本)`}{rule.required ? " *" : ""}</label>
                             <textarea
+                                ref={promptRef}
                                 value={prompt}
                                 maxLength={typeof rule.max_length === "number" ? rule.max_length : undefined}
                                 placeholder={name === "prompt" ? "描述主体、动作、场景、镜头…" : `输入 ${name}`}
@@ -1030,13 +1103,13 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
             {(!preset || preset.hasPrompt) && !preset?.tts ? (
                 <>
                     <label style={s.label}>提示词</label>
-                    <textarea value={prompt} placeholder="描述主体、动作、场景、镜头…" onWheel={(e) => e.stopPropagation()} onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }} style={s.prompt} />
+                    <textarea ref={promptRef} value={prompt} placeholder="描述主体、动作、场景、镜头…" onWheel={(e) => e.stopPropagation()} onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }} style={s.prompt} />
                 </>
             ) : null}
             {preset?.tts ? (
                 <>
                     <label style={s.label}>合成文本(prompt_text)</label>
-                    <textarea value={prompt} placeholder="要朗读的文本…" onWheel={(e) => e.stopPropagation()} onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }} style={s.prompt} />
+                    <textarea ref={promptRef} value={prompt} placeholder="要朗读的文本…" onWheel={(e) => e.stopPropagation()} onChange={(e) => { setPrompt(e.target.value); patch({ prompt: e.target.value }); }} style={s.prompt} />
                 </>
             ) : null}
                 </>
@@ -1138,7 +1211,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.3.1",
+    version: "1.3.2",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [
