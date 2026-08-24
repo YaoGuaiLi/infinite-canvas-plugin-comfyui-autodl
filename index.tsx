@@ -59,6 +59,39 @@ function findPreset(workflowId: string): WorkflowPreset | undefined {
     return WORKFLOWS.find((workflow) => workflow.id === workflowId);
 }
 
+// 常用参数中英对照:动态表单标签优先显示中文,字典没有的显示原参数名
+const PARAM_LABELS: Record<string, string> = {
+    prompt: "提示词",
+    prompt_text: "合成文本",
+    negative_prompt: "负面提示词",
+    duration: "时长(秒)",
+    audio_duration: "音频截取(秒)",
+    resolution: "分辨率",
+    seed: "随机种子",
+    cfg_scale: "引导系数",
+    steps: "采样步数",
+    aspect_ratio: "宽高比",
+    batch_size: "生成数量",
+    num_images: "生成数量",
+    fps: "帧率",
+    temperature: "温度",
+    top_p: "多样性(top_p)",
+    emo_random: "随机情感",
+    emo_control_method: "情感控制方式",
+    emo_sad: "悲伤",
+    emo_calm: "平静",
+    emo_angry: "愤怒",
+    emo_happy: "愉悦",
+    emo_afraid: "恐惧",
+    emo_disgusted: "厌恶",
+    emo_surprised: "惊讶",
+    emo_melancholic: "忧郁",
+};
+
+function paramLabel(name: string): string {
+    return PARAM_LABELS[name] ?? name;
+}
+
 // ---------------------------------------------------------------------------
 // metadata 约定(内置字段 + 插件自定义字段):
 //   content 结果资源 URL;prompt 提示词;status/errorDetails/progress/taskId 运行状态
@@ -270,18 +303,6 @@ type InputRule = {
     options?: Array<{ label: string }>;
 };
 
-async function fetchInputRules(apiBase: string, workflowId: string, token: string, signal: AbortSignal): Promise<Record<string, InputRule>> {
-    try {
-        const response = await fetch(`${apiBase}/api/v1/comfyui/workflows/${encodeURIComponent(workflowId)}`, { headers: { Authorization: token }, signal });
-        if (!response.ok) return {};
-        const payload = (await response.json().catch(() => null)) as { code?: string; data?: { input_rules?: Record<string, InputRule> } } | null;
-        if (payload?.code !== "Success" || !payload.data?.input_rules) return {};
-        return payload.data.input_rules;
-    } catch {
-        return {}; // 详情接口不可用时静默降级为本地预设校验
-    }
-}
-
 // 旧版(无 input_rules 时)的必填校验:与 assembleBody 内联校验一致
 function validateLegacy(preset: WorkflowPreset | undefined, body: Record<string, unknown>): string | null {
     if (preset?.firstLastFrame && (!body.first_frame || !body.last_frame)) return "首尾帧工作流需要 2 张参考图:连线两个图片节点,或在「手动参考图」里每行填一个图片 URL";
@@ -443,9 +464,14 @@ type WorkflowCatalog = {
 
 const CATALOG_TTL_MS = 10 * 60 * 1000;
 
-async function fetchJson<T>(url: string, token: string | null, signal: AbortSignal): Promise<T | null> {
+async function fetchJson<T>(url: string, token: string | null, signal: AbortSignal, init?: { method?: string; jsonBody?: string }): Promise<T | null> {
     try {
-        const response = await fetch(url, { headers: token ? { Authorization: token } : {}, signal });
+        const response = await fetch(url, {
+            method: init?.method ?? "GET",
+            headers: { ...(token ? { Authorization: token } : {}), ...(init?.jsonBody ? { "Content-Type": "application/json" } : {}) },
+            body: init?.jsonBody,
+            signal,
+        });
         if (!response.ok) return null;
         const payload = (await response.json().catch(() => null)) as { code?: string; data?: unknown } | null;
         if (payload?.code !== "Success" || payload.data == null) return null;
@@ -619,7 +645,36 @@ async function runWorkflow(ctx: CanvasNodeContext) {
 const SPINNER_CSS = `
 .ca-autodl-spin{animation:ca-autodl-spin .9s linear infinite}
 @keyframes ca-autodl-spin{to{transform:rotate(360deg)}}
+.ca-autodl select{color-scheme:dark}
+.ca-autodl-light select{color-scheme:light}
+.ca-autodl select option{background:#262626;color:#f2f2f2}
+.ca-autodl-light select option{background:#ffffff;color:#1a1a1a}
 `;
+
+// 主题亮度检测:原生下拉弹层用 color-scheme 跟随明暗主题
+function colorLuminance(color: string): number | null {
+    const hex = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(color.trim());
+    if (hex) {
+        let value = hex[1];
+        if (value.length === 3) value = value.split("").map((c) => c + c).join("");
+        const num = parseInt(value, 16);
+        return (0.2126 * ((num >> 16) & 255) + 0.7152 * ((num >> 8) & 255) + 0.0722 * (num & 255)) / 255;
+    }
+    const rgb = /^rgba?\(([^)]+)\)$/i.exec(color.trim());
+    if (rgb) {
+        const parts = rgb[1].split(/[,/\s]+/).filter(Boolean).map(Number);
+        if (parts.length >= 3 && parts.every((n) => Number.isFinite(n))) return (0.2126 * parts[0] + 0.7152 * parts[1] + 0.0722 * parts[2]) / 255;
+    }
+    return null;
+}
+
+function isDarkTheme(theme: CanvasNodeContext["theme"]): boolean {
+    const panel = colorLuminance(String(theme.toolbar?.panel ?? ""));
+    if (panel != null) return panel < 0.5;
+    const text = colorLuminance(String(theme.node?.text ?? ""));
+    if (text != null) return text > 0.5; // 亮色文字 → 深色背景
+    return true;
+}
 
 function Spinner() {
     return <span className="ca-autodl-spin" style={{ width: 14, height: 14, borderRadius: "50%", border: "2px solid currentColor", borderTopColor: "transparent", display: "inline-block" }} />;
@@ -861,19 +916,29 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     const tokenMissing = tokenLoaded && !tokenDraft.trim();
 
     return (
-        <div data-canvas-no-zoom onMouseDown={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()} style={s.card}>
+        <div data-canvas-no-zoom className={`ca-autodl ${isDarkTheme(ctx.theme) ? "ca-autodl-dark" : "ca-autodl-light"}`} onMouseDown={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()} style={s.card}>
             <div style={s.row}>
                 <div style={{ ...s.cell, flex: "2 1 60%" }}>
-                    <label style={s.label}>工作流{catalog ? (catalog.fetchedAt ? "" : "(内置预设,联网后自动更新)") : "(加载中…)"}</label>
+                    <label style={s.label}>工作流 · {catalog ? (catalog.fetchedAt ? "官方动态列表" : "内置预设(离线)") : "加载中…"}</label>
                     <select value={workflowId} onChange={(e) => selectWorkflow(e.target.value)} style={s.pill}>
                         <option value="">自定义(手填 ID)</option>
                         {(catalog?.workflows ?? WORKFLOWS.map((preset) => ({ id: preset.id, label: preset.label }))).map((item) => (
                             <option key={item.id} value={item.id}>{item.label}</option>
                         ))}
                     </select>
-                    <div style={{ ...s.hint, marginTop: 3 }}>
-                        {dynamicEntry?.description ? `${dynamicEntry.description.slice(0, 80)}… · ` : ""}
-                        {dynamicEntry?.label ?? preset?.desc ?? workflowId} · {workflowId || "未选择"}
+                    <div style={{ ...s.hint, marginTop: 3, display: "flex", justifyContent: "space-between", alignItems: "center", gap: 6 }}>
+                        <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {workflowId || "未选择"}{dynamicEntry?.description ? ` · ${dynamicEntry.description.slice(0, 60)}…` : ""}
+                        </span>
+                        <span
+                            role="button"
+                            title="重新拉取官方工作流列表"
+                            onClick={() => void refreshCatalog()}
+                            style={{ cursor: "pointer", flexShrink: 0, opacity: 0.75 }}
+                            onMouseDown={(e) => e.stopPropagation()}
+                        >
+                            ↻ 刷新
+                        </span>
                     </div>
                 </div>
                 <div style={s.cell}>
@@ -923,7 +988,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                             if (rule.type === "boolean") {
                                 return (
                                     <div key={name} style={s.cell}>
-                                        <label style={s.label}>{name}</label>
+                                        <label style={s.label} title={name}>{paramLabel(name)}</label>
                                         <select value={raw || String(rule.default ?? "")} onChange={(e) => setValue(e.target.value)} style={s.pill}>
                                             <option value="true">开启</option>
                                             <option value="false">关闭</option>
@@ -934,7 +999,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                             if (rule.type === "enum" && rule.options?.length) {
                                 return (
                                     <div key={name} style={s.cell}>
-                                        <label style={s.label}>{name}</label>
+                                        <label style={s.label} title={name}>{paramLabel(name)}</label>
                                         <select value={raw || String(rule.default ?? "")} onChange={(e) => setValue(e.target.value)} style={s.pill}>
                                             {rule.options.map((option) => (
                                                 <option key={option.label} value={option.label}>{option.label}</option>
@@ -946,14 +1011,14 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                             if (rule.type === "number") {
                                 return (
                                     <div key={name} style={s.cell}>
-                                        <label style={s.label}>{name}{typeof rule.min === "number" && typeof rule.max === "number" ? `(${rule.min}-${rule.max})` : ""}</label>
+                                        <label style={s.label} title={name}>{paramLabel(name)}{typeof rule.min === "number" && typeof rule.max === "number" ? `(${rule.min}-${rule.max})` : ""}</label>
                                         <input value={raw} placeholder={rule.default !== undefined ? `默认 ${rule.default}` : "数值"} inputMode="decimal" onChange={(e) => setValue(e.target.value)} style={s.pill} />
                                     </div>
                                 );
                             }
                             return (
                                 <div key={name} style={{ ...s.cell, flexBasis: "100%" }}>
-                                    <label style={s.label}>{name}{rule.required ? " *" : ""}</label>
+                                    <label style={s.label} title={name}>{paramLabel(name)}{rule.required ? " *" : ""}</label>
                                     <input value={raw} placeholder={`输入 ${name}`} onChange={(e) => setValue(e.target.value)} style={s.pill} />
                                 </div>
                             );
@@ -977,7 +1042,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                 </>
             )}
 
-            {(preset?.duration || preset?.resolutions || preset?.seed || preset?.audioDuration) ? (
+            {!usingDynamic && (preset?.duration || preset?.resolutions || preset?.seed || preset?.audioDuration) ? (
                 <div style={s.row}>
                     {preset?.duration ? (
                         <div style={s.cell}>
@@ -1073,7 +1138,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.3.0",
+    version: "1.3.1",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [
