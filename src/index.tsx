@@ -251,6 +251,21 @@ function clamp(value: number, range: { min: number; max: number }): number {
     return Math.min(range.max, Math.max(range.min, value));
 }
 
+// API 要求 duration 为 JSON number;兼容旧节点/paramsJson 中保存的字符串值。
+function normalizeDuration(body: Record<string, unknown>): void {
+    if (!("duration" in body)) return;
+    const raw = body.duration;
+    if (typeof raw === "number" && Number.isFinite(raw)) return;
+    if (typeof raw === "string" && raw.trim()) {
+        const value = Number(raw.trim());
+        if (Number.isFinite(value)) {
+            body.duration = value;
+            return;
+        }
+    }
+    throw new Error("duration 必须是数字");
+}
+
 // 组装请求体:结构化字段 → 参考素材 → paramsJson 覆盖(优先级最高);随后校验必填项
 function assembleBody(preset: WorkflowPreset | undefined, meta: Record<string, unknown>, refs: { images: string[]; audios: string[] }): Record<string, unknown> {
     const body: Record<string, unknown> = {};
@@ -288,6 +303,8 @@ function assembleBody(preset: WorkflowPreset | undefined, meta: Record<string, u
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error('额外参数必须是 JSON 对象,如 {"duration": 5}');
         Object.assign(body, parsed);
     }
+
+    normalizeDuration(body);
 
     // 必填校验(以组装后的最终 body 为准,paramsJson 可补齐)
     if (preset?.firstLastFrame && (!body.first_frame || !body.last_frame)) throw new Error("首尾帧工作流需要 2 张参考图:连线两个图片节点,或在「手动参考图」里每行填一个图片 URL");
@@ -634,6 +651,8 @@ async function runWorkflow(ctx: CanvasNodeContext) {
                 }
             }
         }
+        // 动态规则可能把 duration 作为字符串规则写回,提交前仍统一为 number。
+        normalizeDuration(body);
         // paramsJson 覆盖后仍以动态规则做最终校验
         if (dynamic) {
             ctx.updateMetadata({ progress: "校验参数…" });
