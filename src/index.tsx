@@ -1213,6 +1213,54 @@ function WorkflowContent({ ctx }: CanvasNodeContentProps) {
     return <img src={url} alt={String(meta.prompt || "")} draggable={false} style={{ width: "100%", height: "100%", objectFit: "contain" }} />;
 }
 
+function WorkflowReferenceBar({ ctx }: { ctx: CanvasNodeContext }) {
+    const references = ctx.getUpstream().filter((node) => upstreamKind(node) !== "other");
+    const removeReference = (fromNodeId: string) => {
+        const ids = ctx.getConnections().filter((connection) => connection.fromNodeId === fromNodeId && connection.toNodeId === ctx.node.id).map((connection) => connection.id);
+        if (ids.length) ctx.applyOps([{ type: "delete_connections", ids }]);
+    };
+    return (
+        <div style={{ marginBottom: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 5 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: ctx.theme.node.muted }}>参考元素</span>
+                <button
+                    type="button"
+                    title="在画布上选择参考元素"
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={() => ctx.startReferenceSelection()}
+                    style={{ display: "inline-flex", alignItems: "center", gap: 4, border: `1px solid ${ctx.theme.toolbar.border}`, borderRadius: 7, padding: "3px 7px", background: "transparent", color: ctx.theme.node.text, cursor: "pointer", fontSize: 11 }}
+                >
+                    <span aria-hidden="true" style={{ fontSize: 15, lineHeight: 1 }}>+</span>
+                    <span>添加参考</span>
+                </button>
+            </div>
+            {references.length ? (
+                <div data-canvas-no-zoom style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 2 }}>
+                    {references.map((node) => {
+                        const kind = upstreamKind(node);
+                        const content = typeof node.metadata?.content === "string" ? node.metadata.content : "";
+                        return (
+                            <div key={node.id} title={node.title || (kind === "image" ? "图片" : "音频")} style={{ position: "relative", width: 42, height: 42, flex: "0 0 auto", overflow: "hidden", display: "grid", placeItems: "center", border: `1px solid ${ctx.theme.toolbar.border}`, borderRadius: 7, background: ctx.theme.toolbar.activeBg, color: ctx.theme.node.muted }}>
+                                {kind === "image" && content ? <img src={content} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <span style={{ fontSize: 11 }}>{kind === "image" ? "图片" : "音频"}</span>}
+                                <button
+                                    type="button"
+                                    aria-label={`移除${kind === "image" ? "图片" : "音频"}参考`}
+                                    title="移除参考"
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onClick={() => removeReference(node.id)}
+                                    style={{ position: "absolute", top: 1, right: 1, width: 16, height: 16, padding: 0, border: 0, borderRadius: "50%", background: "rgba(0,0,0,.66)", color: "#fff", cursor: "pointer", fontSize: 12, lineHeight: "16px" }}
+                                >
+                                    ×
+                                </button>
+                            </div>
+                        );
+                    })}
+                </div>
+            ) : <div style={{ color: ctx.theme.node.placeholder, fontSize: 11 }}>尚未添加画布参考元素</div>}
+        </div>
+    );
+}
+
 function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
     const meta = ctx.node.metadata ?? {};
     const s = ui(ctx);
@@ -1408,6 +1456,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 
     return (
         <div data-canvas-no-zoom className={`ca-autodl ${isDarkTheme(ctx.theme) ? "ca-autodl-dark" : "ca-autodl-light"}`} onMouseDown={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()} style={s.card}>
+            <WorkflowReferenceBar ctx={ctx} />
             <div style={s.row}>
                 <div style={{ ...s.cell, flex: "2 1 60%" }}>
                     <label style={s.label}>工作流 · {catalog ? (catalog.fetchedAt ? "官方动态列表" : "内置预设(离线)") : "加载中…"}{refreshNote ? ` · ${refreshNote}` : ""}</label>
@@ -1671,7 +1720,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.4.1",
+    version: "1.4.2",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [
