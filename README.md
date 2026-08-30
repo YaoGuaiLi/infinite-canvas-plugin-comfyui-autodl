@@ -66,6 +66,19 @@
 3. 点「▶ 生成」或 hover 工具栏按钮。状态实时显示排队/执行中,可随时「■ 停止」。
 4. 成功后节点内预览结果;连到下游生成节点时,按图片/视频资源被消费。
 
+## Agent 技能（直接调用 AutoDL）
+
+已抽取独立技能 `skills/autodl-comfyui-video`，包含完整的 AutoDL.Art ComfyUI 工作流说明和 Python 客户端。用户级副本位于 `C:\Users\birdy\.codex\skills\autodl-comfyui-video`，其他 Agent 可直接使用 `$autodl-comfyui-video`。
+
+```powershell
+$env:AUTODL_TOKEN = "<令牌管理中创建的 ComfyUI Token>"
+python .\skills\autodl-comfyui-video\scripts\autodl_comfyui.py list
+python .\skills\autodl-comfyui-video\scripts\autodl_comfyui.py describe --workflow minimax_h3_lightx2v_no_pic
+python .\skills\autodl-comfyui-video\scripts\autodl_comfyui.py generate --workflow minimax_h3_lightx2v_no_pic --prompt "描述视频" --output .\output.mp4
+```
+
+默认 API 地址是 `https://autodl.art`（HTTPS 443）；可用 `AUTODL_BASE_URL`/`AUTODL_API_BASE` 指向带端口的反向代理。脚本默认不会保存或输出 Token。若你在本地私有副本的 `scripts/autodl_comfyui.py` 中填写 `EMBEDDED_AUTODL_TOKEN`，它会优先于环境变量和 `.env`；不要把填写后的文件提交到 Git。模型和参数详情见技能的 `references/workflows.md`。
+
 ## 开发
 
 ```bash
