@@ -4,6 +4,14 @@
 
 ## 更新日志
 
+### v1.4.2(2026-08-30)
+
+- **新增:参考元素快捷添加。** 工作流面板提供「+ 添加参考」入口,调用宿主无限画布原生参考选择器,可在画布中连续点选多个图片/音频元素并自动建立连线;面板内可移除单个已添加参考。SDK 新增 `ctx.startReferenceSelection()` 公开方法。
+
+### v1.4.1(2026-08-30)
+
+- **新增:结果视频/音频自动本地缓存。** 任务成功后插件会尝试下载结果并写入宿主 `infinite-canvas` 的 `media_files` IndexedDB,节点元数据保存 `storageKey`;节点移动、重新挂载或页面刷新后优先从本地 Blob 恢复,不再重复请求短期有效的结果 URL。若下载受跨域或网络限制失败,自动回退到原始 URL并保留结果展示。
+
 ### v1.4.0(2026-08-24)
 
 - **新增:@ 素材引用升级为缩略图 chip 输入(对齐官方生图/生视频节点的交互)。** 提示词输入框从 textarea 换成 contentEditable 富文本:提示词里的 `@图片N` 直接内联渲染为 22px 缩略图(点击弹出大图预览),`@音频N` 渲染为音频胶囊;输入 `@` 弹出候选菜单(带缩略图/图标与节点标题,↑↓ 选择、Enter 或点击插入、Esc 关闭),Backspace/Delete 整块删除 chip;值仍序列化为纯文本标签,提交前照旧剥离。上方「引用素材」行的标签同步升级为缩略图样式。
@@ -57,6 +65,19 @@
    - 结果类型选自动/图片/视频。
 3. 点「▶ 生成」或 hover 工具栏按钮。状态实时显示排队/执行中,可随时「■ 停止」。
 4. 成功后节点内预览结果;连到下游生成节点时,按图片/视频资源被消费。
+
+## Agent 技能（直接调用 AutoDL）
+
+已抽取独立技能 `skills/autodl-comfyui-video`，包含完整的 AutoDL.Art ComfyUI 工作流说明和 Python 客户端。用户级副本位于 `C:\Users\birdy\.codex\skills\autodl-comfyui-video`，其他 Agent 可直接使用 `$autodl-comfyui-video`。
+
+```powershell
+$env:AUTODL_TOKEN = "<令牌管理中创建的 ComfyUI Token>"
+python .\skills\autodl-comfyui-video\scripts\autodl_comfyui.py list
+python .\skills\autodl-comfyui-video\scripts\autodl_comfyui.py describe --workflow minimax_h3_lightx2v_no_pic
+python .\skills\autodl-comfyui-video\scripts\autodl_comfyui.py generate --workflow minimax_h3_lightx2v_no_pic --prompt "描述视频" --output .\output.mp4
+```
+
+默认 API 地址是 `https://autodl.art`（HTTPS 443）；可用 `AUTODL_BASE_URL`/`AUTODL_API_BASE` 指向带端口的反向代理。脚本默认不会保存或输出 Token。若你在本地私有副本的 `scripts/autodl_comfyui.py` 中填写 `EMBEDDED_AUTODL_TOKEN`，它会优先于环境变量和 `.env`；不要把填写后的文件提交到 Git。模型和参数详情见技能的 `references/workflows.md`。
 
 ## 开发
 

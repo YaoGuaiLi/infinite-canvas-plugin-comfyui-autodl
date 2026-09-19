@@ -96,7 +96,7 @@ function paramLabel(name: string): string {
 
 // ---------------------------------------------------------------------------
 // metadata 约定(内置字段 + 插件自定义字段):
-//   content 结果资源 URL;prompt 提示词;status/errorDetails/progress/taskId 运行状态
+//   content 结果资源 URL(缓存后为 blob:);storageKey 本地媒体持久化键;prompt 提示词;status/errorDetails/progress/taskId 运行状态
 //   workflowId 工作流 ID;paramsJson 额外请求参数(JSON,优先级最高)
 //   wfDuration/wfResolution/wfSeed/wfAudioDuration 结构化参数
 //   refImageUrls/refAudioUrls 手动参考素材 URL(每行一个,排在上游连线之前)
@@ -172,6 +172,43 @@ type RefSource = { url: string; storageKey?: string };
 // 宿主 localforage 库名固定为 infinite-canvas,image 存 image_files,音视频存 media_files
 const HOST_IMAGE_STORE = localforage.createInstance({ name: "infinite-canvas", storeName: "image_files" });
 const HOST_MEDIA_STORE = localforage.createInstance({ name: "infinite-canvas", storeName: "media_files" });
+const storedObjectUrls = new Map<string, string>();
+
+function newStorageKey(kind: "video" | "audio"): string {
+    const id = typeof crypto?.randomUUID === "function" ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    return `${kind}:${id}`;
+}
+
+async function cacheResultMedia(result: { url: string; fileType?: string }, kind: Exclude<ResultKind, "auto" | "image">, signal: AbortSignal): Promise<{ url: string; storageKey?: string; mimeType?: string; bytes?: number }> {
+    // AutoDL 结果 URL 可能带短期签名;下载失败时保留远端地址,不阻断生成结果。
+    if (!REMOTE_URL.test(result.url)) return { url: result.url, mimeType: result.fileType };
+    try {
+        const response = await fetch(result.url, { signal });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        const blob = await response.blob();
+        if (!blob.size) throw new Error("empty response");
+        const mimeType = blob.type && blob.type !== "application/octet-stream" ? blob.type : result.fileType || (kind === "video" ? "video/mp4" : "audio/mpeg");
+        const storedBlob = blob.type === mimeType ? blob : new Blob([blob], { type: mimeType });
+        const storageKey = newStorageKey(kind);
+        await HOST_MEDIA_STORE.setItem(storageKey, storedBlob);
+        const localUrl = URL.createObjectURL(storedBlob);
+        storedObjectUrls.set(storageKey, localUrl);
+        return { url: localUrl, storageKey, mimeType, bytes: storedBlob.size };
+    } catch (error) {
+        if (signal.aborted) throw error;
+        return { url: result.url, mimeType: result.fileType };
+    }
+}
+
+async function resolveStoredMediaUrl(storageKey: string, fallback: string): Promise<string> {
+    const existing = storedObjectUrls.get(storageKey);
+    if (existing) return existing;
+    const blob = await HOST_MEDIA_STORE.getItem<Blob>(storageKey);
+    if (!blob) return fallback;
+    const url = URL.createObjectURL(blob);
+    storedObjectUrls.set(storageKey, url);
+    return url;
+}
 
 async function readStoredBlob(storageKey: string): Promise<Blob | null> {
     const [family] = storageKey.split(":");
@@ -251,6 +288,21 @@ function clamp(value: number, range: { min: number; max: number }): number {
     return Math.min(range.max, Math.max(range.min, value));
 }
 
+// API 要求 duration 为 JSON number;兼容旧节点/paramsJson 中保存的字符串值。
+function normalizeDuration(body: Record<string, unknown>): void {
+    if (!("duration" in body)) return;
+    const raw = body.duration;
+    if (typeof raw === "number" && Number.isFinite(raw)) return;
+    if (typeof raw === "string" && raw.trim()) {
+        const value = Number(raw.trim());
+        if (Number.isFinite(value)) {
+            body.duration = value;
+            return;
+        }
+    }
+    throw new Error("duration 必须是数字");
+}
+
 // 组装请求体:结构化字段 → 参考素材 → paramsJson 覆盖(优先级最高);随后校验必填项
 function assembleBody(preset: WorkflowPreset | undefined, meta: Record<string, unknown>, refs: { images: string[]; audios: string[] }): Record<string, unknown> {
     const body: Record<string, unknown> = {};
@@ -288,6 +340,8 @@ function assembleBody(preset: WorkflowPreset | undefined, meta: Record<string, u
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error('额外参数必须是 JSON 对象,如 {"duration": 5}');
         Object.assign(body, parsed);
     }
+
+    normalizeDuration(body);
 
     // 必填校验(以组装后的最终 body 为准,paramsJson 可补齐)
     if (preset?.firstLastFrame && (!body.first_frame || !body.last_frame)) throw new Error("首尾帧工作流需要 2 张参考图:连线两个图片节点,或在「手动参考图」里每行填一个图片 URL");
@@ -634,6 +688,8 @@ async function runWorkflow(ctx: CanvasNodeContext) {
                 }
             }
         }
+        // 动态规则可能把 duration 作为字符串规则写回,提交前仍统一为 number。
+        normalizeDuration(body);
         // paramsJson 覆盖后仍以动态规则做最终校验
         if (dynamic) {
             ctx.updateMetadata({ progress: "校验参数…" });
@@ -649,7 +705,8 @@ async function runWorkflow(ctx: CanvasNodeContext) {
         const result = await pollResult(apiBase, taskId, token, controller.signal, (progress) => ctx.updateMetadata({ progress }));
         const wanted = String(meta.resultKind || "auto") as ResultKind;
         const kind = wanted !== "auto" ? wanted : preset ? preset.resultKind : detectKind(result.url, result.fileType);
-        ctx.updateMetadata({ content: result.url, status: "success", progress: undefined, resultKind: kind });
+        const cached = kind === "video" || kind === "audio" ? await cacheResultMedia(result, kind, controller.signal) : { url: result.url, mimeType: result.fileType };
+        ctx.updateMetadata({ content: cached.url, storageKey: cached.storageKey, mimeType: cached.mimeType, bytes: cached.bytes, status: "success", progress: undefined, resultKind: kind });
     } catch (error) {
         if (controller.signal.aborted) ctx.updateMetadata({ status: "idle", progress: undefined });
         else ctx.updateMetadata({ status: "error", errorDetails: messageOf(error), progress: undefined });
@@ -1094,7 +1151,26 @@ function MentionPromptInput({ value, onChange, items, ctx, style, placeholder }:
 
 function WorkflowContent({ ctx }: CanvasNodeContentProps) {
     const meta = ctx.node.metadata ?? {};
-    const url = typeof meta.content === "string" ? meta.content : "";
+    const storedKey = typeof meta.storageKey === "string" ? meta.storageKey : "";
+    const metadataUrl = typeof meta.content === "string" ? meta.content : "";
+    const [url, setUrl] = useState(metadataUrl);
+    useEffect(() => {
+        let active = true;
+        if (!storedKey || (!storedKey.startsWith("video:") && !storedKey.startsWith("audio:"))) {
+            setUrl(metadataUrl);
+            return () => {
+                active = false;
+            };
+        }
+        void resolveStoredMediaUrl(storedKey, metadataUrl).then((resolved) => {
+            if (!active) return;
+            setUrl(resolved);
+            if (resolved && resolved !== metadataUrl) ctx.updateMetadata({ content: resolved });
+        });
+        return () => {
+            active = false;
+        };
+    }, [metadataUrl, storedKey]);
     const kind = typeof meta.resultKind === "string" ? meta.resultKind : "auto";
     const showVideo = url && (kind === "video" || (kind === "auto" && VIDEO_EXT.test(url)));
     const showAudio = url && !showVideo && (kind === "audio" || (kind === "auto" && AUDIO_EXT.test(url)));
@@ -1135,6 +1211,54 @@ function WorkflowContent({ ctx }: CanvasNodeContentProps) {
         );
     }
     return <img src={url} alt={String(meta.prompt || "")} draggable={false} style={{ width: "100%", height: "100%", objectFit: "contain" }} />;
+}
+
+function WorkflowReferenceBar({ ctx }: { ctx: CanvasNodeContext }) {
+    const references = ctx.getUpstream().filter((node) => upstreamKind(node) !== "other");
+    const removeReference = (fromNodeId: string) => {
+        const ids = ctx.getConnections().filter((connection) => connection.fromNodeId === fromNodeId && connection.toNodeId === ctx.node.id).map((connection) => connection.id);
+        if (ids.length) ctx.applyOps([{ type: "delete_connections", ids }]);
+    };
+    return (
+        <div style={{ marginBottom: 8 }}>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, marginBottom: 5 }}>
+                <span style={{ fontSize: 11, fontWeight: 600, color: ctx.theme.node.muted }}>参考元素</span>
+                <button
+                    type="button"
+                    title="在画布上选择参考元素"
+                    onMouseDown={(event) => event.stopPropagation()}
+                    onClick={() => ctx.startReferenceSelection()}
+                    style={{ display: "inline-flex", alignItems: "center", gap: 4, border: `1px solid ${ctx.theme.toolbar.border}`, borderRadius: 7, padding: "3px 7px", background: "transparent", color: ctx.theme.node.text, cursor: "pointer", fontSize: 11 }}
+                >
+                    <span aria-hidden="true" style={{ fontSize: 15, lineHeight: 1 }}>+</span>
+                    <span>添加参考</span>
+                </button>
+            </div>
+            {references.length ? (
+                <div data-canvas-no-zoom style={{ display: "flex", gap: 6, overflowX: "auto", paddingBottom: 2 }}>
+                    {references.map((node) => {
+                        const kind = upstreamKind(node);
+                        const content = typeof node.metadata?.content === "string" ? node.metadata.content : "";
+                        return (
+                            <div key={node.id} title={node.title || (kind === "image" ? "图片" : "音频")} style={{ position: "relative", width: 42, height: 42, flex: "0 0 auto", overflow: "hidden", display: "grid", placeItems: "center", border: `1px solid ${ctx.theme.toolbar.border}`, borderRadius: 7, background: ctx.theme.toolbar.activeBg, color: ctx.theme.node.muted }}>
+                                {kind === "image" && content ? <img src={content} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : <span style={{ fontSize: 11 }}>{kind === "image" ? "图片" : "音频"}</span>}
+                                <button
+                                    type="button"
+                                    aria-label={`移除${kind === "image" ? "图片" : "音频"}参考`}
+                                    title="移除参考"
+                                    onMouseDown={(event) => event.stopPropagation()}
+                                    onClick={() => removeReference(node.id)}
+                                    style={{ position: "absolute", top: 1, right: 1, width: 16, height: 16, padding: 0, border: 0, borderRadius: "50%", background: "rgba(0,0,0,.66)", color: "#fff", cursor: "pointer", fontSize: 12, lineHeight: "16px" }}
+                                >
+                                    ×
+                                </button>
+                            </div>
+                        );
+                    })}
+                </div>
+            ) : <div style={{ color: ctx.theme.node.placeholder, fontSize: 11 }}>尚未添加画布参考元素</div>}
+        </div>
+    );
 }
 
 function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
@@ -1332,6 +1456,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 
     return (
         <div data-canvas-no-zoom className={`ca-autodl ${isDarkTheme(ctx.theme) ? "ca-autodl-dark" : "ca-autodl-light"}`} onMouseDown={(e) => e.stopPropagation()} onWheel={(e) => e.stopPropagation()} style={s.card}>
+            <WorkflowReferenceBar ctx={ctx} />
             <div style={s.row}>
                 <div style={{ ...s.cell, flex: "2 1 60%" }}>
                     <label style={s.label}>工作流 · {catalog ? (catalog.fetchedAt ? "官方动态列表" : "内置预设(离线)") : "加载中…"}{refreshNote ? ` · ${refreshNote}` : ""}</label>
@@ -1575,7 +1700,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
                         </div>
                     ) : null}
                     {!busy && meta.status === "error" ? <div style={s.danger}>{String(meta.errorDetails || "")}</div> : null}
-                    {!busy && meta.status !== "error" && !tokenMissing ? <div style={s.hint}>视频按时长计费(1080p 更贵),TTS 按次计费;结果 URL 短时效,请及时下载。</div> : null}
+                    {!busy && meta.status !== "error" && !tokenMissing ? <div style={s.hint}>视频按时长计费(1080p 更贵),TTS 按次计费;结果视频/音频会自动缓存到本地。</div> : null}
                 </div>
                 <button type="button" style={s.runButton(busy)} onClick={() => (busy ? stopWorkflow(ctx.node.id) : void runWorkflow(ctx))}>
                     {busy ? (
@@ -1595,7 +1720,7 @@ function WorkflowPanel({ ctx }: CanvasNodePanelProps) {
 export default definePlugin({
     id: "comfyui-autodl",
     name: "AutoDL ComfyUI 工作流",
-    version: "1.4.0",
+    version: "1.4.2",
     description: "调用 AutoDL.Art ComfyUI 工作流:内置 H3 文生/多图参考/首尾帧/对口型视频与 IndexTTS2 语音合成预设,参考素材从上游连线自动收集。",
     css: SPINNER_CSS,
     nodes: [

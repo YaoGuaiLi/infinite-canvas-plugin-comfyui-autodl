@@ -1,0 +1,4 @@
+interface:
+  display_name: "AutoDL ComfyUI Video"
+  short_description: "Generate AutoDL ComfyUI videos to local files"
+  default_prompt: "Use $autodl-comfyui-video to generate a local video with an AutoDL ComfyUI workflow."
