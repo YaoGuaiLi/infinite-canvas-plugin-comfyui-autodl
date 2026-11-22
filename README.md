@@ -19,7 +19,7 @@
 
 ## Agent 技能（直接调用 AutoDL）
 
-已抽取独立技能 `skills/autodl-comfyui-video`，包含完整的 AutoDL.Art ComfyUI 工作流说明和 Python 客户端。用户级副本位于 `C:\Users\xxx\.codex\skills\autodl-comfyui-video`，其他 Agent 可直接使用 `$autodl-comfyui-video`。
+已抽取独立技能 `skills/autodl-comfyui-video`，包含完整的 AutoDL.Art ComfyUI 工作流说明和 Python 客户端。把该目录复制到你的 Agent 技能目录（例如 Codex 的 `~/.codex/skills/`）后即可用 `$autodl-comfyui-video` 调用。
 
 ```powershell
 $env:AUTODL_TOKEN = "<令牌管理中创建的 ComfyUI Token>"
@@ -67,7 +67,7 @@ infinite-canvas-plugin-comfyui-autodl/
 ## 开发
 
 ```bash
-cd D:\benma\benma-github\infinite-canvas-plugin-comfyui-autodl
+cd infinite-canvas-plugin-comfyui-autodl
 npm install
 npm run dev      # watch 构建,产物同步到 web/public/plugins/comfyui-autodl.js
 npm run typecheck
