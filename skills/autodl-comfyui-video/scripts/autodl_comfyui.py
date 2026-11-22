@@ -21,7 +21,7 @@ DEFAULT_BASE_URL = "https://autodl.art"
 # If populated locally, this value has the highest credential precedence.
 EMBEDDED_AUTODL_TOKEN = ""
 POLL_INTERVAL = 2.0
-POLL_TIMEOUT = 15 * 60
+POLL_TIMEOUT = int(os.environ.get("AUTODL_POLL_TIMEOUT", str(15 * 60)))
 MAX_IMAGES = 9
 MAX_AUDIOS = 3
 
@@ -114,9 +114,24 @@ def api_json(url: str, token: str | None, *, method: str = "GET", body: Any = No
 
 
 def list_workflows(api: str, token: str | None) -> list[dict[str, Any]]:
-    data = api_json(f"{api}/api/v1/comfyui/workflows", token, method="POST", body={})
-    entries = data.get("list", []) if isinstance(data, dict) else []
-    return entries if isinstance(entries, list) else []
+    """列出工作流。服务端分页（默认 20 条/页），必须翻页，否则只会拿到第一页。"""
+    def page(index: int) -> dict[str, Any]:
+        d = api_json(f"{api}/api/v1/comfyui/workflows", token, method="POST",
+                     body={"page_index": index, "page_size": 100})
+        return d if isinstance(d, dict) else {}
+
+    first = page(1)
+    entries = first.get("list", [])
+    entries = list(entries) if isinstance(entries, list) else []
+    try:
+        max_page = int(first.get("max_page") or 1)
+    except (TypeError, ValueError):
+        max_page = 1
+    for index in range(2, max_page + 1):
+        more = page(index).get("list", [])
+        if isinstance(more, list):
+            entries.extend(more)
+    return entries
 
 
 def workflow_rules(api: str, workflow: str, token: str) -> dict[str, dict[str, Any]]:
@@ -151,13 +166,15 @@ def parse_param(raw: str) -> tuple[str, Any]:
 
 def slot_kind(rule: dict[str, Any]) -> str | None:
     typ = rule.get("type")
-    if typ in ("image", "audio"):
+    if typ in ("image", "audio", "video"):
         return typ
     for accepted in rule.get("accept_types", []) or []:
         if str(accepted).startswith("image/"):
             return "image"
         if str(accepted).startswith("audio/"):
             return "audio"
+        if str(accepted).startswith("video/"):
+            return "video"
     return None
 
 
@@ -165,7 +182,7 @@ def natural_key(value: str) -> list[Any]:
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", value)]
 
 
-def dynamic_body(workflow: str, rules: dict[str, dict[str, Any]], args: argparse.Namespace, images: list[str], audios: list[str], params: dict[str, Any]) -> dict[str, Any]:
+def dynamic_body(workflow: str, rules: dict[str, dict[str, Any]], args: argparse.Namespace, images: list[str], audios: list[str], params: dict[str, Any], videos: list[str] | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {}
     if args.prompt:
         prompt_name = "prompt_text" if workflow == "indextts2-v1" and "prompt" not in rules else "prompt"
@@ -173,7 +190,24 @@ def dynamic_body(workflow: str, rules: dict[str, dict[str, Any]], args: argparse
             prompt_name = "prompt_text"
         body[prompt_name] = args.prompt
     image_queue, audio_queue = list(images), list(audios)
+    video_queue = list(videos or [])
     overrides = dict(parse_param(value) for value in args.slot)
+
+    # 动态模式下这些专用参数以前被完全忽略（只认 --param），会静默提交默认值。
+    # 这里并入 params；因为用 setdefault，--param / --params-json 仍然优先。
+    if getattr(args, "duration", None) is not None:
+        params.setdefault("duration", int(args.duration))
+    if getattr(args, "audio_duration", None) is not None:
+        params.setdefault("audio_duration", int(args.audio_duration))
+    if getattr(args, "resolution", None):
+        params.setdefault("resolution", args.resolution)
+    if getattr(args, "seed", None) is not None:
+        params.setdefault("seed", int(args.seed))
+    # 首尾帧在规则里是命名槽位（first_frame / last_frame），不走 ref_image_N。
+    if getattr(args, "first_frame", None):
+        overrides.setdefault("first_frame", args.first_frame)
+    if getattr(args, "last_frame", None):
+        overrides.setdefault("last_frame", args.last_frame)
     for name, rule in sorted(rules.items(), key=lambda item: natural_key(item[0])):
         kind = slot_kind(rule)
         if name in overrides:
@@ -182,6 +216,8 @@ def dynamic_body(workflow: str, rules: dict[str, dict[str, Any]], args: argparse
             body[name] = image_queue.pop(0)
         elif kind == "audio" and audio_queue:
             body[name] = audio_queue.pop(0)
+        elif kind == "video" and video_queue:
+            body[name] = video_queue.pop(0)
         elif kind is None and name not in body and "default" in rule:
             body[name] = rule["default"]
     body.update(params)
@@ -293,7 +329,10 @@ def submit_and_poll(api: str, workflow: str, body: dict[str, Any], token: str) -
             return url, file_type, str(task_id)
         if status in {"FAILED", "FAILURE", "CANCELED", "CANCELLED", "ERROR"}:
             raise RuntimeError(f"工作流执行失败：{status}")
-    raise RuntimeError("轮询超时（15 分钟）")
+    raise RuntimeError(
+        f"轮询超时（{POLL_TIMEOUT} 秒）；task_id={task_id}，任务可能仍在服务端运行，"
+        "可用 result 接口续查，不要重新提交（会重复计费）"
+    )
 
 
 def download(url: str, output: Path, timeout: float = 300) -> None:
@@ -324,6 +363,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--output", required=True, type=Path)
     generate.add_argument("--image", action="append", default=[], help="参考图路径或公网 URL，可重复")
     generate.add_argument("--audio", action="append", default=[], help="参考音频路径或公网 URL，可重复")
+    generate.add_argument("--video", action="append", default=[], help="参考视频路径或公网 URL，可重复")
     generate.add_argument("--first-frame")
     generate.add_argument("--last-frame")
     generate.add_argument("--duration", type=float)
@@ -353,6 +393,7 @@ def main() -> int:
         return 0
     images = [read_reference(value) for value in args.image]
     audios = [read_reference(value) for value in args.audio]
+    videos = [read_reference(value) for value in args.video]
     if args.first_frame:
         args.first_frame = read_reference(args.first_frame)
     if args.last_frame:
@@ -372,7 +413,7 @@ def main() -> int:
     args.prompt = re.sub(r"@(?:图片|音频)\d+", " ", args.prompt)
     args.prompt = re.sub(r"\s{2,}", " ", args.prompt).strip()
     if rules:
-        body = dynamic_body(args.workflow, rules, args, images, audios, params)
+        body = dynamic_body(args.workflow, rules, args, images, audios, params, videos)
     else:
         preset = PRESETS.get(args.workflow)
         if not preset:
