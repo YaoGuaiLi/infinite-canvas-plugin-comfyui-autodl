@@ -7,7 +7,7 @@
 	- [Allow CORS: Access-Control-Allow-Origin - Chrome Web Store](https://chromewebstore.google.com/detail/allow-cors-access-control/lhobafahddgcelffkeicbaginigeejlf)
 2. 插件安装地址 
 	- 右上角，插件，导入第三方插件。
-	- `https://github.com/lingkuma/infinite-canvas-plugin-comfyui-autodl/raw/refs/heads/dev/dist/infinite-canvas-plugin-comfyui-autodl.js`
+	- `https://github.com/YaoGuaiLi/infinite-canvas-plugin-comfyui-autodl/raw/refs/heads/main/dist/infinite-canvas-plugin-comfyui-autodl.js`
 3. 到 [令牌管理](https://autodl.art/large-model/tokens) 创建令牌,**分组选 ComfyUI**。
 4. 画布新建「ComfyUI 工作流」节点(🧩),点击打开面板:
    - 填 Token(仅存本机插件存储 `ctx.storage`,不写入画布数据);
@@ -37,9 +37,7 @@ infinite-canvas-plugin-comfyui-autodl/
 ├─ src/
 │  └─ index.tsx              # 插件全部源码:节点渲染、配置面板、动态表单、提交/轮询、本地缓存
 ├─ dist/                     # 构建产物(npm run build 生成,勿手改)
-│  ├─ comfyui-autodl.js
 │  └─ infinite-canvas-plugin-comfyui-autodl.js
-├─ comfyui-autodl.js         # 根目录单文件产物(直接引用/分发用)
 ├─ mcp/
 │  └─ Agent.md               # 外部 Agent 接入画布(MCP / HTTP)与本插件节点操控笔记
 ├─ skills/
@@ -60,7 +58,7 @@ infinite-canvas-plugin-comfyui-autodl/
 
 | 目录 | 使用方 | 作用 |
 |---|---|---|
-| `src/` | 画布用户 | 插件本体:画布里的「ComfyUI 工作流」节点。唯一源码文件是 `index.tsx`,构建后输出到 `dist/`,安装方式是给「节点插件」管理器一个 `dist/comfyui-autodl.js` 的 URL。 |
+| `src/` | 画布用户 | 插件本体:画布里的「ComfyUI 工作流」节点。唯一源码文件是 `index.tsx`,构建后输出到 `dist/`,安装方式是给「节点插件」管理器一个 `dist/infinite-canvas-plugin-comfyui-autodl.js` 的 URL。 |
 | `skills/autodl-comfyui-video/` | 外部 Agent | 把插件能力抽成命令行技能,`scripts/autodl_comfyui.py` 直接调 AutoDL 接口(`list` / `describe` / `generate`),不需要画布,结果下载到本地。 |
 | `mcp/` | 外部 Agent | 说明怎么把 Agent 接进无限画布(`@basketikun/canvas-agent` 的 MCP / `POST /api/tools`),以及如何建/配 `comfyui-autodl:workflow` 插件节点(含 metadata 字段表与坑位)。 |
 
@@ -69,19 +67,19 @@ infinite-canvas-plugin-comfyui-autodl/
 ```bash
 cd infinite-canvas-plugin-comfyui-autodl
 npm install
-npm run dev      # watch 构建,产物同步到 web/public/plugins/comfyui-autodl.js
+npm run dev      # watch 构建,产物同步到 web/public/plugins/infinite-canvas-plugin-comfyui-autodl.js
 npm run typecheck
 ```
 
-启动画布 `web` 后,「节点插件」管理器会自动发现本插件(默认关闭),打开开关即用;或用 `VITE_DEV_PLUGINS=/plugins/comfyui-autodl.js` 热载。
+启动画布 `web` 后,「节点插件」管理器会自动发现本插件(默认关闭),打开开关即用;或用 `VITE_DEV_PLUGINS=/plugins/infinite-canvas-plugin-comfyui-autodl.js` 热载。
 
 ## 发布
 
 ```bash
-npm run build    # → dist/comfyui-autodl.js
+npm run build    # → dist/infinite-canvas-plugin-comfyui-autodl.js
 ```
 
-把 `dist/comfyui-autodl.js` 托管到任意静态地址(CDN、GitHub Raw、对象存储),用户在「节点插件」管理器填 URL 安装;升级覆盖同一 URL 后用户点「更新」。
+把 `dist/infinite-canvas-plugin-comfyui-autodl.js` 托管到任意静态地址(CDN、GitHub Raw、对象存储),用户在「节点插件」管理器填 URL 安装;升级覆盖同一 URL 后用户点「更新」。
 
 ## 说明与注意
 
